@@ -414,12 +414,12 @@ def _board_summary(slug: str, db: str, pulse_from: int) -> dict[str, Any]:
     with closing(_ro(db)) as conn:
         counts = {r["status"]: r["c"] for r in _q(conn, "SELECT status, COUNT(*) c FROM tasks GROUP BY status")}
         running = _q(conn, """
-            SELECT t.id, t.title, t.assignee, t.current_run_id, t.worker_started_at,
+            SELECT t.id, t.title, t.assignee, t.current_run_id,
                    t.last_heartbeat_at, t.priority, t.project_id, t.workspace_kind,
-                   r.status AS run_status, r.outcome AS run_outcome
+                   r.status AS run_status, r.outcome AS run_outcome, r.started_at AS run_started_at
               FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id
              WHERE t.status = 'running'
-             ORDER BY COALESCE(t.worker_started_at, t.last_heartbeat_at, 0)
+             ORDER BY COALESCE(r.started_at, t.last_heartbeat_at, 0)
         """)
         done_today = _q1(conn, "SELECT COUNT(*) c FROM tasks WHERE status='done' AND completed_at >= ?", (_today_start(),))
         created_today = _q1(conn, "SELECT COUNT(*) c FROM tasks WHERE created_at >= ?", (_today_start(),))
@@ -442,7 +442,10 @@ def _board_summary(slug: str, db: str, pulse_from: int) -> dict[str, Any]:
     in_flight = []
     now = _now()
     for r in running:
-        started = _int_or_none(r["worker_started_at"]) or _int_or_none(r["last_heartbeat_at"])
+        # NEVER worker_started_at: that column holds the PID-reuse fingerprint
+        # (kanban_db_dispatch._set_worker_pid), not a time. The CURRENT run's start is the real
+        # elapsed basis; heartbeat age comes from last_heartbeat_at.
+        started = _int_or_none(r["run_started_at"]) or _int_or_none(r["last_heartbeat_at"])
         hb = _int_or_none(r["last_heartbeat_at"])
         in_flight.append({
             "board": slug,
