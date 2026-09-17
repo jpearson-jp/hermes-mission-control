@@ -79,3 +79,15 @@ table.mc-table tr:hover td { background: color-mix(in srgb, var(--color-ring) 6%
 .mc-cmt { display: flex; flex-direction: column; gap: .15rem; padding-bottom: .45rem; }
 .mc-cmt-b { white-space: pre-wrap; font-size: .76rem; }
 a.mc-link { color: var(--color-ring); text-decoration: none; font-size: .74rem; cursor: pointer; }
+
+/* --- card identity + handoff tools --- */
+.mc-tools { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; }
+.mc-id { font-family: ui-monospace, monospace; font-size: .72rem; letter-spacing: .02em;
+  padding: .12rem .4rem; border-radius: 999px; cursor: pointer;
+  border: 1px dashed var(--color-border); color: var(--color-foreground); opacity: .85; }
+.mc-id:hover { border-color: var(--color-ring); opacity: 1; }
+.mc-brief { font-size: .74rem; }
+.mc-brief > summary { cursor: pointer; color: var(--color-muted-foreground); }
+.mc-brief-pre { white-space: pre-wrap; font-size: .72rem; line-height: 1.35; margin: .35rem 0 0;
+  padding: .5rem .6rem; border: 1px solid var(--color-border); border-radius: var(--radius, .5rem);
+  max-height: 18rem; overflow: auto; user-select: text; }

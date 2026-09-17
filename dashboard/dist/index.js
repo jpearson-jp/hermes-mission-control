@@ -33,6 +33,74 @@
     if (!iso) return "—";
     try { return new Date(iso).toISOString().slice(5, 16).replace("T", " "); } catch (e) { return "—"; }
   }
+
+  // ---------------------------------------------------------------- clipboard + chat handoff
+  function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+    } catch (e) { /* fall through to the legacy path */ }
+    return new Promise(function (resolve, reject) {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error("execCommand copy refused"));
+      } catch (e) { reject(e); }
+    });
+  }
+
+  /** The dashboard's own chat tab, carrying the profile this page is scoped to. */
+  function chatHref() {
+    var p = null;
+    try { p = new URLSearchParams(window.location.search).get("profile"); } catch (e) { /* ignore */ }
+    return "/chat" + (p ? "?profile=" + encodeURIComponent(p) : "");
+  }
+
+  /**
+   * Card identity + the two handoffs. The card id is always visible — copying it into a chat by
+   * hand is the floor, not the ceiling. "Chat about it" copies the full context block AND opens
+   * the dashboard's real chat tab (a new surface's own PTY), so the conversation has the card.
+   */
+  function CardTools(props) {
+    var it = props.item;
+    var [note, setNote] = useState(null);
+    var label = props.label || it.id;
+
+    function copyOnly(what) {
+      var text = what === "id" ? it.id : (it.briefing || it.id);
+      copyText(text).then(function () {
+        setNote(what === "id" ? "ID copied (" + it.id + ")" : "context copied — paste it into the chat");
+      }, function (e) {
+        setNote("copy failed: " + e.message + " — select the text by hand");
+      });
+    }
+
+    function chatNow() {
+      // Open first, inside the click gesture: a popup opened after an await gets blocked.
+      try { window.open(chatHref(), "_blank", "noopener"); } catch (e) { /* popup blocked */ }
+      copyText(it.briefing || it.id).then(function () {
+        setNote("chat opened + context copied → paste with Ctrl-V");
+      }, function () {
+        setNote("chat opened — copy the context from the card panel by hand");
+      });
+    }
+
+    return h("div", { className: "mc-tools" },
+      h("span", { className: "mc-id", title: "card id (click to copy)", onClick: function () { copyOnly("id"); } }, label),
+      h("button", { className: "mc-btn", onClick: function () { copyOnly("id"); } }, "Copy ID"),
+      h("button", { className: "mc-btn", onClick: function () { copyOnly("ctx"); } }, "Copy context"),
+      h("button", { className: "mc-btn mc-btn-p", onClick: chatNow }, "Chat about it ↗"),
+      props.extra || null,
+      note ? h("span", { className: "mc-ok" }, note) : null);
+  }
   function usePoll(path, ms) {
     var [state, set] = useState({ data: null, error: null, at: null });
     var load = useCallback(function () {
@@ -51,6 +119,18 @@
   // ---------------------------------------------------------------- pieces
   function Pill(props) {
     return h("span", { className: "mc-pill " + (props.kind || "") }, props.children);
+  }
+
+  /** A copyable card id — the floor of the handoff, usable inside tables. */
+  function IdChip(props) {
+    var [done, setDone] = useState(false);
+    return h("span", {
+      className: "mc-id",
+      title: "click to copy this card id",
+      onClick: function () {
+        copyText(props.id).then(function () { setDone(true); setTimeout(function () { setDone(false); }, 1500); });
+      }
+    }, done ? "copied" : props.id);
   }
   function Stat(props) {
     return h("div", { className: "mc-stat" },
@@ -108,12 +188,16 @@
         h("div", { style: { flex: "1 1 auto" } },
           h("div", { className: "mc-row-t" }, item.title),
           h("div", { className: "mc-row-m" },
-            h(Pill, null, item.board),
             h(Pill, { kind: "mc-pill-me" }, "needs you"),
-            item.assignee ? h("span", null, item.assignee) : null,
+            h("span", null, "project: " + (item.board_title || item.board)),
+            h("span", null, "asked by " + (item.assignee || "unknown")),
             h("span", null, "parked " + dur(item.age_seconds) + " ago"),
-            h("span", null, item.comments + " comments"))),
+            h("span", null, item.comments + " comments"),
+            (item.hints || []).map(function (x) {
+              return h(Pill, { key: x, kind: "mc-pill-warn" }, x);
+            }))),
         h("button", { className: "mc-btn", onClick: function () { setOpen(!open); } }, open ? "hide" : "open")),
+      h(CardTools, { item: item }),
       item.summary ? h("div", { className: "mc-sum" }, item.summary) : null,
       !open && item.ask ? h("div", { className: "mc-ask" }, item.ask.slice(0, 320) + (item.ask.length > 320 ? "…" : "")) : null,
       open ? h("div", { className: "mc-cards" },
@@ -165,7 +249,7 @@
     return h(Panel, {
       title: t.title,
       right: h("div", { className: "mc-actions" },
-        h(Pill, null, ref.board), h(Pill, null, t.status), t.block_kind ? h(Pill, { kind: "mc-pill-warn" }, t.block_kind) : null,
+        h(Pill, null, d.board_title || ref.board), h(Pill, null, t.status), t.block_kind ? h(Pill, { kind: "mc-pill-warn" }, t.block_kind) : null,
         h("button", { className: "mc-btn", onClick: props.onClose }, "close"))
     },
       h("div", { className: "mc-row-m" },
@@ -173,6 +257,15 @@
         h("span", null, "created " + hhmm(t.created_at)),
         t.branch_name ? h("span", null, t.branch_name) : null,
         d.parents.length ? h("span", null, "parents: " + d.parents.map(function (p) { return p.id + "(" + p.status + ")"; }).join(", ")) : null),
+      (d.hints || []).length ? h("div", { className: "mc-row-m" },
+        (d.hints || []).map(function (x) { return h(Pill, { key: x, kind: "mc-pill-warn" }, x); })) : null,
+      h(CardTools, {
+        item: { id: t.id, briefing: d.briefing },
+        extra: h("span", { className: "mc-muted" }, "cli: hermes kanban --board " + ref.board + " show " + t.id)
+      }),
+      h("details", { className: "mc-brief" },
+        h("summary", null, "the context block that gets copied (select it by hand if the clipboard is blocked)"),
+        h("pre", { className: "mc-brief-pre" }, d.briefing || "")),
       d.frame && d.frame.summary ? h("div", { className: "mc-sum" }, d.frame.summary) : null,
       h("div", { className: "mc-body" }, t.body || "(no body)"),
       h("div", { className: "mc-muted" }, "ask (newest park reason)"),
@@ -248,8 +341,9 @@
               return h("div", { key: i.board + i.id, className: "mc-row" },
                 h("div", { className: "mc-row-t" }, i.title),
                 h("div", { className: "mc-row-m" },
-                  h(Pill, null, i.board), i.assignee ? h("span", null, i.assignee) : null,
+                  h(Pill, null, i.board_title || i.board), i.assignee ? h("span", null, "asked by " + i.assignee) : null,
                   h("span", null, "parked " + dur(i.age_seconds)),
+                  h(IdChip, { id: i.id }),
                   h("a", { className: "mc-link", onClick: function () { setDetail({ board: i.board, id: i.id }); } }, "open card")),
                 i.ask ? h("div", { className: "mc-ask" }, i.ask.slice(0, 260) + "…") : null,
                 h("div", { className: "mc-actions" },
@@ -266,7 +360,9 @@
                 return h("tr", { key: r.board + r.id },
                   h("td", null, h(Pill, null, r.board)),
                   h("td", null, h("a", { className: "mc-link", onClick: function () { setDetail({ board: r.board, id: r.id }); } }, r.title),
-                    r.project_id ? h("div", { className: "mc-muted" }, r.project_id) : null),
+                    h("div", { className: "mc-row-m" },
+                      h(IdChip, { id: r.id }),
+                      r.project_id ? h("span", null, r.project_id) : null)),
                   h("td", null, r.profile || "—"),
                   h("td", null, dur(r.elapsed_seconds)),
                   h("td", null, r.heartbeat_age_seconds != null && r.heartbeat_age_seconds > 300
@@ -280,6 +376,7 @@
                 h("div", { className: "mc-row-t" }, c.title),
                 h("div", { className: "mc-row-m" }, h(Pill, null, c.board), h("span", null, c.assignee || "—"),
                   h("span", null, hhmm(c.completed_at)), h("span", null, c.runs + " runs"),
+                  h(IdChip, { id: c.id }),
                   h("a", { className: "mc-link", onClick: function () { setDetail({ board: c.board, id: c.id }); } }, "open card")));
             })) : h("div", { className: "mc-muted" }, "Nothing completed in the last day."))),
 

@@ -46,6 +46,20 @@ _HUMAN_HINT_RE = re.compile(r"\bjesse\b|\bowner\b|\byour call\b|\bneeds your\b",
 OPTION_PREVIEW_CHARS = 260
 ASK_PREVIEW_CHARS = 700
 
+# Cheap, honest triage tags for the ask text — a label, not a classification to trust blindly.
+_HINT_PATTERNS = (
+    ("deadline", re.compile(r"\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|"
+                            r"\b\d{4}-\d{2}-\d{2}\b|\bdeadline\b|\bdue\b", re.I)),
+    ("credential", re.compile(r"\bkey\b|\btoken\b|\bcredential|\brotate\b|\bpassword\b|\bre-?auth", re.I)),
+    ("money", re.compile(r"\b\$|\binvoice\b|\bpayment\b|\bpricing\b|\bcontract\b|\bbudget\b", re.I)),
+    ("decision", re.compile(r"\bdecide\b|\bdecision\b|\bchoose\b|\boption\b|\bdirection\b|\bapprove", re.I)),
+)
+
+
+def _hints(ask: Optional[str], title: Optional[str]) -> list[str]:
+    text = f"{title or ''}\n{ask or ''}"
+    return [name for name, rx in _HINT_PATTERNS if rx.search(text)]
+
 
 # --- locations ---------------------------------------------------------------
 
@@ -84,6 +98,10 @@ def _boards() -> list[dict[str, Any]]:
     return out
 
 
+def _board_title(slug: str) -> str:
+    return next((b["title"] for b in _boards() if b["slug"] == slug), slug)
+
+
 def _ro(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=8)
     conn.row_factory = sqlite3.Row
@@ -118,8 +136,12 @@ def _iso(ts: Any) -> Optional[str]:
 
 
 def _int_or_none(value: Any) -> Optional[int]:
-    """Timestamps are INTEGER columns but a few rows carry a marker string
-    (observed: ``'<uuid>:60|20617508'`` in ``worker_started_at``), so never trust the type."""
+    """Coerce a kanban timestamp to int, or None.
+
+    ``worker_started_at`` is NOT a timestamp and never was: it holds the PID-reuse fingerprint
+    ``"<boot epoch>|<proc start tick>"`` written by ``kanban_db_dispatch._set_worker_pid``
+    (e.g. ``'5edae10e-...:60|20617508'``), so keep using this guard — but for elapsed/staleness
+    read ``task_runs.started_at`` or ``tasks.last_heartbeat_at`` instead."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -292,6 +314,44 @@ def _ask_reasons(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
     return out
 
 
+def _briefing(board: str, board_title: str, task_id: str, title: str, status: str, block_kind: str,
+              age_seconds: Optional[int], asked_by: Optional[str], ask: Optional[str],
+              options: Optional[list[str]] = None, recommendation: Optional[int] = None) -> str:
+    """A paste-ready handoff: everything a chat agent needs to discuss this card with Jesse.
+
+    Lives server-side so the dashboard button, any future surface, and a curl all produce the same
+    text — and so it is testable without a browser.
+    """
+    hours = (age_seconds or 0) / 3600.0
+    age = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+    lines = [
+        f"MISSION CONTROL HANDOFF — card {task_id} on board {board} ({board_title})",
+        f"Title: {title}",
+        f"State: {status}" + (f"/{block_kind}" if block_kind else "") +
+        f" · parked {age} ago · parked by {asked_by or 'unknown'}",
+    ]
+    if options:
+        lines.append("")
+        lines.append("Options this card already frames for me:")
+        for i, opt in enumerate(options, 1):
+            mark = "  <-- the card's RECOMMENDATION" if recommendation == i else ""
+            lines.append(f"  {i}. {opt}{mark}")
+    lines += [
+        "",
+        "THE ASK (verbatim — the newest park reason on the card):",
+        (ask or "(no park reason recorded)"),
+        "",
+        "My question: explain in plain language what this card is actually about, which project or "
+        "system it belongs to, and whether it is genuinely mine to decide — then tell me what you "
+        "would do and why.",
+        "",
+        "If I give you a decision, record it on this card as a comment and unblock it so the owning "
+        "profile picks the work back up.",
+        f"Inspect it yourself with: hermes kanban --board {board} show {task_id}",
+    ]
+    return "\n".join(lines)
+
+
 def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
     """Every owner-facing park on this board, split into framed asks and un-framed parks.
 
@@ -313,14 +373,17 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         frame = parse_frame(body)
         ask = reasons.get(task_id)
         hinted = bool(ask and _HUMAN_HINT_RE.search(ask))
+        bt = _board_title(slug)
+        age = _now() - (_int_or_none(r["created_at"]) or _now())
         return {
             "board": slug,
+            "board_title": bt,
             "id": r["id"],
             "title": r["title"],
             "assignee": r["assignee"],
             "status": r["status"],
             "created_at": _iso(r["created_at"]),
-            "age_seconds": _now() - (_int_or_none(r["created_at"]) or _now()),
+            "age_seconds": age,
             "ask": (ask or "")[:ASK_PREVIEW_CHARS] or None,
             "framed": frame["framed"],
             "options": frame["options"],
@@ -328,7 +391,10 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
             "summary": frame["summary"],
             "comments": int(r["comments"] or 0),
             "human_hint": hinted,
+            "hints": _hints(ask, r["title"]),
             "priority": r["priority"],
+            "briefing": _briefing(slug, bt, r["id"], r["title"], r["status"], "needs_input", age,
+                                  r["assignee"], ask, frame["options"], frame["recommendation"]),
         }
 
     framed = [item(i) for i in framed_ids]
@@ -502,8 +568,12 @@ def card(board: str, task_id: str = Query(..., alias="id")):
         """, (task_id,))
     ask = _reason_from_payload(next((e["payload"] for e in events if e["kind"] == "blocked"), None))
     frame_body = next((c["body"] for c in comments if c["body"] and _FRAME_MARKER in c["body"]), None)
+    frame = parse_frame(frame_body)
+    bt = b["title"]
+    age = _now() - (_int_or_none(t["created_at"]) or _now())
     return {
         "board": board,
+        "board_title": bt,
         "task": {
             "id": t["id"], "title": t["title"], "body": t["body"], "status": t["status"],
             "assignee": t["assignee"], "priority": t["priority"], "block_kind": t["block_kind"],
@@ -515,7 +585,10 @@ def card(board: str, task_id: str = Query(..., alias="id")):
             "branch_name": t["branch_name"], "project_id": t["project_id"],
         },
         "ask": ask,
-        "frame": parse_frame(frame_body),
+        "frame": frame,
+        "hints": _hints(ask, t["title"]),
+        "briefing": _briefing(board, bt, t["id"], t["title"], t["status"], t["block_kind"], age,
+                              t["assignee"], ask, frame["options"], frame["recommendation"]),
         "comments": [{"id": c["id"], "author": c["author"], "body": c["body"],
                       "created_at": _iso(c["created_at"])} for c in comments],
         "runs": [{"id": r["id"], "profile": r["profile"], "status": r["status"], "outcome": r["outcome"],
