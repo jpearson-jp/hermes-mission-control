@@ -1009,11 +1009,41 @@ def estate(hours: int = Query(24, ge=1, le=336)):
                 e["asks"] += int(r["asks"] or 0)
                 e["done_window"] += int(r["done_window"] or 0)
 
+    # What each bot is FOR. Every profile carries a profile.yaml description whose first token is a
+    # bracketed domain tag ("[TOS ENGINEERING] …") — the only machine-readable statement of purpose
+    # in the estate, and without it a 63-profile scoreboard is just names and numbers.
     profiles_dir = _hermes_home() / "profiles"
     if profiles_dir.is_dir():
         for p in sorted(profiles_dir.iterdir()):
-            if p.is_dir() and not p.name.startswith("."):
-                entry(p.name)
+            if not p.is_dir() or p.name.startswith("."):
+                continue
+            e = entry(p.name)
+            purpose, domain = None, None
+            manifest = p / "profile.yaml"
+            if manifest.is_file():
+                raw = ""
+                try:
+                    import yaml
+
+                    data = yaml.safe_load(manifest.read_text()) or {}
+                    raw = str(data.get("description") or "").strip()
+                except Exception:
+                    raw = ""
+                if not raw:  # fallback: a plain single-line description
+                    for line in manifest.read_text().splitlines():
+                        if line.startswith("description:"):
+                            raw = line.split(":", 1)[1].strip().strip("'\"")
+                            break
+                if raw:
+                    m = re.match(r"^\[([^\]]{2,40})\]\s*(.*)$", raw, re.S)
+                    if m:
+                        domain, raw = m.group(1).strip(), m.group(2).strip()
+                    purpose = " ".join(raw.split())[:400] or None
+            e["purpose"], e["domain"] = purpose, domain
+
+    for e in rows.values():
+        e.setdefault("purpose", None)
+        e.setdefault("domain", None)
 
     items = sorted(rows.values(), key=lambda e: (-(e["jobs_failing"]), -(e["asks"]), -(e["running"]),
                                                  -(e["blocked"]), e["profile"]))

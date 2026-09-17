@@ -624,18 +624,38 @@ function EstatePage() {
 
   const t = d.totals || {}
   const all = d.profiles || []
-  const scheduled = all.filter(p => p.jobs)
-  const working = all.filter(p => !p.jobs && (p.running || p.open || p.blocked))
   const idle = all.filter(p => !p.jobs && !p.running && !p.open && !p.blocked)
+
+  // Group by the domain tag each bot carries in its profile description — that is what makes a
+  // 63-bot estate legible: you scan "FINANCE / TOS ENGINEERING / PLATFORM OPS", not 63 names.
+  const byDomain = new Map()
+  for (const p of all) {
+    const key = p.domain || 'unlabelled'
+    if (!byDomain.has(key)) byDomain.set(key, [])
+    byDomain.get(key).push(p)
+  }
+  const weight = list => list.reduce((n, p) => n + p.jobs_failing * 1000 + p.asks * 10 + p.running + p.blocked, 0)
+  const groups = [...byDomain.entries()]
+    .map(([domain, list]) => ({
+      domain,
+      list: [...list].sort((a, b) => weight([b]) - weight([a])),
+      failing: list.reduce((n, p) => n + p.jobs_failing, 0),
+      asks: list.reduce((n, p) => n + p.asks, 0),
+      running: list.reduce((n, p) => n + p.running, 0),
+      active: list.filter(p => p.jobs || p.running || p.open || p.blocked).length
+    }))
+    .sort((a, b) => weight(b.list) - weight(a.list))
 
   const botRow = p => jsxs('div', { className: 'mc-row', children: [
     jsxs('div', { className: 'mc-row-m', children: [
-      jsx('span', { className: p.jobs_failing ? 'mc-warn-text' : undefined, children: p.profile }),
+      jsx('span', { children: p.profile }),
+      !p.jobs && !p.running && !p.open && !p.blocked ? jsx(Badge, { variant: 'outline', children: 'idle' }) : null,
       p.jobs ? jsx('span', { children: `${p.jobs_enabled}/${p.jobs} jobs` }) : null,
       p.jobs_failing ? jsx(Badge, { variant: 'outline', children: `${p.jobs_failing} failing` }) : null,
       p.last_status ? jsx('span', { children: `last: ${p.last_status}` }) : null,
       p.next_run_at ? jsx('span', { children: `next ${relativeTime(p.next_run_at)}` }) : null
     ] }),
+    p.purpose ? jsx('div', { className: 'mc-ask', children: p.purpose.slice(0, 260) }) : null,
     jsxs('div', { className: 'mc-row-m', children: [
       jsx('span', { children: `${p.running} running` }),
       jsx('span', { children: `${p.open} open` }),
@@ -662,8 +682,12 @@ function EstatePage() {
       jsx(Tile, { k: 'blocked', v: fmtNum(t.blocked), n: 'blocked across the estate' }),
       jsx(Tile, { k: 'idle', v: fmtNum(idle.length), n: 'profiles with nothing on their plate' })
     ] }),
-    jsx(Section, { title: 'Bots with a schedule', sub: `${scheduled.length} profiles`, children: scheduled.map(botRow) }),
-    jsx(Section, { title: 'Bots with a plate, no schedule', sub: `${working.length} profiles`, children: working.length ? working.map(botRow) : jsx(EmptyState, { title: 'none' }) }),
+    jsx(Section, { title: 'Every bot, by domain', sub: `${groups.length} domains · ${all.length} profiles`, children: jsx('div', { className: 'mc-row-m', children: 'grouped by the domain in each bot\u2019s own profile description; busiest and most broken first' }) }),
+    groups.map(gr => jsx(Section, {
+      title: gr.domain,
+      sub: `${gr.list.length} bots · ${gr.active} active · ${gr.running} running · ${gr.asks} needing input${gr.failing ? ` · ${gr.failing} failing` : ''}`,
+      children: gr.list.map(botRow)
+    }, gr.domain)),
     jsx(Section, { title: 'Idle', sub: `${idle.length} profiles — nothing scheduled, nothing assigned`, children: jsx('div', { className: 'mc-row-m', children: idle.map(p => jsx('span', { children: p.profile }, p.profile)) }) })
   ] })
 }
