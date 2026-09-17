@@ -1104,3 +1104,127 @@ def since(ts: int = Query(..., ge=0)):
         "finished": finished,
         "parked": parked,
     }
+
+
+@router.get("/unowned")
+def unowned(limit: int = Query(60, ge=1, le=400)):
+    """Work nobody is on: cards with no assignee, oldest first. The other half of 'too many things'."""
+    limit = _int_or_none(limit) or 60
+    now = _now()
+    items: list[dict[str, Any]] = []
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            for r in _q(conn, """
+                SELECT id, title, status, COALESCE(block_kind,'') kind, created_at, priority
+                  FROM tasks
+                 WHERE (assignee IS NULL OR TRIM(assignee) = '') AND status IN ('todo','ready','triage','blocked')
+                 ORDER BY created_at ASC LIMIT ?
+            """, (limit,)):
+                items.append({
+                    "board": b["slug"], "board_title": b["title"], "id": r["id"], "title": r["title"],
+                    "status": r["status"], "kind": r["kind"], "priority": r["priority"],
+                    "age_seconds": now - (_int_or_none(r["created_at"]) or now),
+                })
+    items.sort(key=lambda i: -(i["age_seconds"] or 0))
+    by_board: dict[str, int] = {}
+    for i in items:
+        by_board[i["board_title"]] = by_board.get(i["board_title"], 0) + 1
+    return {"generated_at": datetime.now(timezone.utc).isoformat(), "total": len(items),
+            "by_board": by_board, "items": items[:limit]}
+
+
+class AssignBody(BaseModel):
+    board: str
+    task_id: str
+    assignee: str
+
+
+@router.post("/assign")
+def assign(body: AssignBody):
+    """Give a card an owner, through ``kanban_db.assign_task`` (the same path the CLI and the bundled
+    kanban plugin use, so the assignment is recorded as an event like any other)."""
+    who = (body.assignee or "").strip()
+    if not who:
+        raise HTTPException(status_code=400, detail="assignee required")
+    with closing(_write_conn(body.board)) as conn:
+        if kanban_db.get_task(conn, body.task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {body.task_id} not found")
+        ok = kanban_db.assign_task(conn, body.task_id, who)
+        if not ok:
+            raise HTTPException(status_code=409, detail="assign refused (state changed?)")
+        after = kanban_db.get_task(conn, body.task_id)
+    return {"ok": True, "task_id": body.task_id, "assignee": (after.assignee if after else who)}
+
+
+@router.get("/attention")
+def attention(days: int = Query(7, ge=1, le=90)):
+    """How the owner-ask pipeline actually performs: filed, answered, and how long each waited.
+
+    Pairs each ``blocked`` (needs_input) event with the first ``unblocked`` event after it on the same
+    card — that interval is the real answer latency, whoever did the answering. ``owner_answers``
+    counts comments authored ``jesse`` (the dashboard's answer path), so a lane that files asks and
+    gets answers is distinguishable from one that files asks into a void.
+    """
+    days = _int_or_none(days) or 7
+    since = _now() - days * 86400
+    now = _now()
+    filed = answered = owner_answers = 0
+    latencies: list[int] = []
+    lanes: dict[str, dict[str, Any]] = {}
+    open_count = 0
+    oldest_open: Optional[int] = None
+
+    def lane(name: Any) -> dict[str, Any]:
+        key = str(name or "unassigned")
+        return lanes.setdefault(key, {"lane": key, "filed": 0, "answered": 0, "_lat": []})
+
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            owners = {r["id"]: r["assignee"] for r in _q(conn, "SELECT id, assignee FROM tasks")}
+            blocks: dict[str, int] = {}
+            for r in _q(conn, "SELECT task_id, created_at FROM task_events "
+                              "WHERE kind='blocked' AND payload LIKE '%needs_input%' AND created_at >= ? "
+                              "ORDER BY created_at", (since,)):
+                ts = _int_or_none(r["created_at"])
+                if ts:
+                    blocks[r["task_id"]] = ts
+            filed += len(blocks)
+            for tid in blocks:
+                lane(owners.get(tid))["filed"] += 1
+            for r in _q(conn, "SELECT task_id, created_at FROM task_events "
+                              "WHERE kind='unblocked' AND created_at >= ? ORDER BY created_at", (since,)):
+                tid, ts = r["task_id"], _int_or_none(r["created_at"])
+                b_at = blocks.get(tid)
+                if b_at and ts and ts >= b_at:
+                    answered += 1
+                    latencies.append(ts - b_at)
+                    entry = lane(owners.get(tid))
+                    entry["answered"] += 1
+                    entry["_lat"].append(ts - b_at)
+            for r in _q(conn, "SELECT COUNT(*) c FROM task_comments WHERE author = 'jesse' AND created_at >= ?",
+                        (since,)):
+                owner_answers += int(r["c"] or 0)
+            for r in _q(conn, "SELECT id, created_at FROM tasks "
+                              "WHERE block_kind='needs_input' AND status IN ('blocked','triage')"):
+                open_count += 1
+                ts = _int_or_none(r["created_at"])
+                if ts and (oldest_open is None or ts < oldest_open):
+                    oldest_open = ts
+
+    for entry in lanes.values():
+        entry["median_s"] = _pct(sorted(entry.pop("_lat")), 0.5)
+    ordered = sorted(lanes.values(), key=lambda e: (-(e["filed"]), e["lane"]))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": days,
+        "filed": filed,
+        "answered": answered,
+        "owner_answers": owner_answers,
+        "answer_rate": round(answered / filed, 3) if filed else None,
+        "median_wait_s": _pct(sorted(latencies), 0.5),
+        "p90_wait_s": _pct(sorted(latencies), 0.9),
+        "measured": len(latencies),
+        "still_open": open_count,
+        "oldest_open_s": (now - oldest_open) if oldest_open else None,
+        "lanes": ordered,
+    }

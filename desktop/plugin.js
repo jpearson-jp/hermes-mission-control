@@ -532,6 +532,7 @@ function InsightsPage() {
         jsx(Section, { title: 'Estate state', sub: 'all boards', children: jsx(StackBar, { segments: statusSegs }) }),
         jsx(Section, { title: 'Why cards are stuck', children: jsx(HBars, { rows: kindRows }) }),
         jsx(Section, { title: 'Who is working', sub: `${fmtNum(runs.started_24h)} started / ${fmtNum(runs.finished_24h)} finished in 24h`, children: jsx(HBars, { rows: peopleRows }) }),
+        jsx(AttentionPanel, {}),
         jsx(Section, { title: 'Schedule health', sub: `${sched.enabled || 0} enabled · ${sched.paused || 0} paused`, children: [
           (sched.failing || []).length ? (sched.failing || []).map(j => jsxs('div', { className: 'mc-row', children: [
             jsx('div', { className: 'mc-row-t', children: j.name || j.id }),
@@ -683,6 +684,7 @@ function EstatePage() {
       jsx(Tile, { k: 'idle', v: fmtNum(idle.length), n: 'profiles with nothing on their plate' })
     ] }),
     jsx(Section, { title: 'Every bot, by domain', sub: `${groups.length} domains · ${all.length} profiles`, children: jsx('div', { className: 'mc-row-m', children: 'grouped by the domain in each bot\u2019s own profile description; busiest and most broken first' }) }),
+    jsx(UnownedPanel, { profiles: all }),
     groups.map(gr => jsx(Section, {
       title: gr.domain,
       sub: `${gr.list.length} bots · ${gr.active} active · ${gr.running} running · ${gr.asks} needing input${gr.failing ? ` · ${gr.failing} failing` : ''}`,
@@ -738,6 +740,106 @@ function CardDirective({ attrs }) {
     ] }),
     d.ask ? jsx('div', { className: 'mc-ask', children: d.ask }) : null
   ] })
+}
+
+// ---------------------------------------------------------------- your attention (ask pipeline)
+
+function AttentionPanel() {
+  const att = useRest('/attention?days=7', 120000)
+  const d = att.data
+  if (att.isError) return jsx(Section, { title: 'Your attention', children: jsx(ErrorState, { title: 'attention data unavailable' }) })
+  if (!d) return jsx(Section, { title: 'Your attention', children: jsx(GlyphSpinner, {}) })
+  const lanes = (d.lanes || []).slice(0, 8)
+  return jsx(Section, {
+    title: 'Your attention',
+    sub: `last ${d.window_days} days · asks filed, and what happened next`,
+    children: [
+      jsxs('div', { className: 'mc-row-m', children: [
+        jsx('span', { children: `${d.filed} asks filed` }),
+        jsx('span', { children: `${d.answered} re-opened after parking` }),
+        jsx('span', { children: `${d.owner_answers} commented on by you` }),
+        jsx('span', { children: `median wait ${fmtAge(d.median_wait_s)} · p90 ${fmtAge(d.p90_wait_s)}` }),
+        jsx('span', { children: `${d.still_open} still open · oldest ${fmtAge(d.oldest_open_s)}` })
+      ] }),
+      jsx('div', { className: 'mc-row-m', children: 'Read the two columns separately: a card re-opened without a comment from you was usually resolved by its own lane (superseded, re-typed, or handed on), not answered by you.' }),
+      lanes.length
+        ? jsx(HBars, { rows: lanes.map(l => ({ label: l.lane, value: l.filed, cls: 'mc-c2', sub: `→ ${l.answered}` })) })
+        : jsx(EmptyState, { title: 'no asks in this window' }),
+      lanes.length
+        ? jsxs('div', { className: 'mc-row-m', children: ['median wait: '].concat(lanes.map(l => jsx('span', { children: `${l.lane} ${fmtAge(l.median_s)}` }, l.lane))) })
+        : null
+    ]
+  })
+}
+
+// ---------------------------------------------------------------- needs an owner (with one-click assign)
+
+function UnownedPanel({ profiles }) {
+  useCss()
+  const u = useRest('/unowned', 60000)
+  const [pick, setPick] = useState({})
+  const [busy, setBusy] = useState(null)
+  const [note, setNote] = useState(null)
+  const d = u.data
+  if (u.isError) return jsx(Section, { title: 'Needs an owner', children: jsx(ErrorState, { title: 'unowned data unavailable' }) })
+  if (!d) return jsx(Section, { title: 'Needs an owner', children: jsx(GlyphSpinner, {}) })
+  if (!d.total) {
+    return jsx(Section, {
+      title: 'Needs an owner',
+      sub: 'every open card has one',
+      children: jsx('div', { className: 'mc-row-m', children: 'Nothing is unowned right now: no card in todo/ready/triage/blocked lacks an assignee.' })
+    })
+  }
+  const names = (profiles || []).map(p => p.profile).filter(Boolean).sort()
+
+  async function submit(item) {
+    const who = pick[item.id]
+    if (!who) {
+      setNote('pick a profile first')
+      return
+    }
+    setBusy(item.id)
+    setNote(null)
+    try {
+      await rest('/assign', { method: 'POST', body: { board: item.board, task_id: item.id, assignee: who } })
+      setNote(`${item.id} is now owned by ${who}`)
+      invalidate()
+    } catch (e) {
+      setNote(`assign failed: ${e.message}`)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return jsx(Section, {
+    title: 'Needs an owner',
+    sub: `${d.total} cards, oldest first`,
+    children: [
+      d.items.slice(0, 12).map(item => jsxs('div', { className: 'mc-row', children: [
+        jsx('div', { className: 'mc-row-t', children: item.title }),
+        jsxs('div', { className: 'mc-row-m', children: [
+          jsx(Badge, { children: item.status }),
+          jsx('span', { children: item.board_title || item.board }),
+          jsx('span', { children: `waiting ${fmtAge(item.age_seconds)}` }),
+          jsx('span', { children: item.id })
+        ] }),
+        jsxs('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }, children: [
+          jsx('select', {
+            value: pick[item.id] || '',
+            onChange: e => setPick({ ...pick, [item.id]: e.target.value }),
+            style: {
+              background: 'transparent', color: 'var(--ui-text-secondary)', fontSize: '11px',
+              border: '1px solid var(--ui-stroke-secondary)', borderRadius: '5px', padding: '2px 6px'
+            },
+            children: [jsx('option', { value: '', children: 'assign to…' }, 'none')]
+              .concat(names.map(n => jsx('option', { value: n, children: n }, n)))
+          }),
+          jsx(Button, { size: 'sm', disabled: busy === item.id, onClick: () => void submit(item), children: busy === item.id ? 'assigning…' : 'Assign' })
+        ] })
+      ] }, item.id)),
+      note ? jsx('div', { className: 'mc-row-m', children: note }) : null
+    ]
+  })
 }
 
 // ---------------------------------------------------------------- the status-bar chip

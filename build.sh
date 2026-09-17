@@ -59,6 +59,20 @@ build_one() {
 
   cp "$HERE/src/style.css" "$dir/dashboard/dist/style.css"
 
+  if [ "$page" = "overview" ]; then
+    # Bootstrap copy of the DESKTOP half, inside the dashboard's static-asset directory.
+    #
+    # Why: the desktop renderer may run on another machine (the owner's laptop) while the backend is
+    # this box — and a remote backend's plugins/ folder is not reachable as a filesystem, so the
+    # unified-package copy step cannot deliver desktop/plugin.js there. The dashboard's static asset
+    # route (/dashboard-plugins/<name>/…) is UNAUTHENTICATED by design, so this copy gives the owner a
+    # URL he can already reach (via his existing tunnel to 127.0.0.1:9119) and curl into place:
+    #   mkdir -p ~/.hermes/desktop-plugins/mission-control
+    #   curl -fsSL http://127.0.0.1:9119/dashboard-plugins/mission-control/dist/desktop-plugin.js \
+    #     -o ~/.hermes/desktop-plugins/mission-control/plugin.js
+    cp "$HERE/desktop/plugin.js" "$dir/dashboard/dist/desktop-plugin.js"
+    echo "  + served copy of the desktop half: dashboard/dist/desktop-plugin.js ($(wc -c < "$dir/dashboard/dist/desktop-plugin.js") bytes)"
+  fi
   if [ "$page" != "overview" ]; then
     sed -e "s|@NAME@|$name|g" -e "s|@LABEL@|$label|g" "$HERE/templates/plugin.yaml.tmpl" > "$dir/plugin.yaml"
     printf '"""%s — agent-side half of the plugin: deliberately empty.\n\nThe whole surface is the web-dashboard extension in ``dashboard/`` (a tab over the hub plugin'"'"'s\nread-only API). It registers no hooks, no tools and no CLI commands.\n"""\n\n\ndef register(ctx):  # noqa: ARG001 — plugin contract requires the entry point\n    """No-op registration: the dashboard extension needs no agent-side wiring."""\n' "$name" > "$dir/__init__.py"
@@ -71,6 +85,23 @@ build_one() {
 for spec in $PAGES; do
   build_one "${spec%%:*}" "${spec##*:}"
 done
+
+# Materialize the desktop half at the APP-LEVEL root (<hermes home>/desktop-plugins/), which is the
+# root that is visible in EVERY profile the app window connects to — per-profile roots are legacy and
+# get migrated into it. Mirroring the app's own copy step here (same file + the same
+# .hermes-package.json marker shape) means an app whose HERMES_HOME is this box picks the half up
+# without waiting for a rescan. Harmless when the renderer lives on another machine.
+HERMES_ROOT="$(dirname "$PLUGINS_DIR")"
+HALF_SRC="$PLUGINS_DIR/mission-control/desktop/plugin.js"
+HALF_DST="$HERMES_ROOT/desktop-plugins/mission-control"
+if [ -f "$HALF_SRC" ]; then
+  mkdir -p "$HALF_DST"
+  cp "$HALF_SRC" "$HALF_DST/plugin.js"
+  MTIME_MS=$(( $(stat -c %Y "$HALF_SRC") * 1000 ))
+  printf '{"package":"mission-control","source":"%s","sourceMtimeMs":%s}\n' "$HALF_SRC" "$MTIME_MS" \
+    > "$HALF_DST/.hermes-package.json"
+  echo "materialized desktop half -> $HALF_DST  (app-level: every profile)"
+fi
 
 echo
 echo "Now: ensure every name is in plugins.enabled in ~/.hermes/config.yaml, rescan the plugin list,"
