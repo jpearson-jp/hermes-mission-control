@@ -244,29 +244,76 @@ def _schedules() -> dict[str, Any]:
 _AWAITING_SQL = """
 SELECT t.id, t.title, t.assignee, t.status, t.block_kind, t.created_at, t.priority,
        t.project_id, t.consecutive_failures,
-       (SELECT e.payload FROM task_events e
-         WHERE e.task_id = t.id AND e.kind = 'blocked' ORDER BY e.id DESC LIMIT 1) AS ask_payload,
-       (SELECT c.body FROM task_comments c
-         WHERE c.task_id = t.id AND c.body LIKE '%OPTIONS FOR THE OWNER%'
-         ORDER BY c.id DESC LIMIT 1) AS frame_body,
        (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.id) AS comments
   FROM tasks t
  WHERE t.block_kind = 'needs_input' AND t.status IN ('blocked', 'triage')
  ORDER BY t.created_at DESC
- LIMIT ?
 """
 
 
-def _awaiting_for_board(slug: str, db: str, limit: int) -> tuple[list[dict[str, Any]], int]:
+def _chunks(seq: list, size: int = 400):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _frame_bodies(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """Newest framed-ask comment per task, for EVERY parked card — not just the newest few.
+
+    Owner asks are not recency-ordered: the nag keeps asking a card parked three days ago, and a
+    windowed fetch silently reports "nothing for you" while the ask exists. Batched IN() keeps this
+    to a couple of queries even with a few hundred parks.
+    """
+    out: dict[str, str] = {}
+    for chunk in _chunks(ids):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT task_id, body FROM task_comments "
+            f"WHERE task_id IN ({marks}) AND body LIKE '%OPTIONS FOR THE OWNER%' ORDER BY id", chunk):
+            out[row["task_id"]] = row["body"]  # last wins == newest
+    return out
+
+
+def _ask_reasons(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """Newest ``blocked`` event reason per task (what the decision-nag quotes as THE ASK)."""
+    out: dict[str, str] = {}
+    for chunk in _chunks(ids):
+        marks = ",".join("?" * len(chunk))
+        latest = {r["task_id"]: r["mid"] for r in conn.execute(
+            f"SELECT task_id, MAX(id) mid FROM task_events "
+            f"WHERE kind='blocked' AND task_id IN ({marks}) GROUP BY task_id", chunk)}
+        if not latest:
+            continue
+        ev_marks = ",".join("?" * len(latest))
+        for row in conn.execute(
+                f"SELECT id, task_id, payload FROM task_events WHERE id IN ({ev_marks})", list(latest.values())):
+            reason = _reason_from_payload(row["payload"])
+            if reason:
+                out[row["task_id"]] = reason
+    return out
+
+
+def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
+    """Every owner-facing park on this board, split into framed asks and un-framed parks.
+
+    The whole park set is inspected for framing (cheap: two batched queries); item *detail* is
+    capped so the payload stays small.
+    """
     with closing(_ro(db)) as conn:
-        rows = _q(conn, _AWAITING_SQL, (limit,))
-        total = _q1(conn, "SELECT COUNT(*) c FROM tasks WHERE block_kind='needs_input' AND status IN ('blocked','triage')")
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        frame = parse_frame(r["frame_body"])
-        ask = _reason_from_payload(r["ask_payload"])
+        rows = _q(conn, _AWAITING_SQL)
+        framed_bodies = _frame_bodies(conn, [r["id"] for r in rows])
+        by_id = {r["id"]: r for r in rows}
+        framed_ids = [r["id"] for r in rows if r["id"] in framed_bodies]
+        # preview budget: every framed ask (they are the point), then the newest un-framed parks
+        preview_ids = framed_ids + [r["id"] for r in rows if r["id"] not in framed_bodies][:limit]
+        reasons = _ask_reasons(conn, preview_ids)
+
+    def item(task_id: str) -> dict[str, Any]:
+        r = by_id[task_id]
+        body = framed_bodies.get(task_id)
+        frame = parse_frame(body)
+        ask = reasons.get(task_id)
         hinted = bool(ask and _HUMAN_HINT_RE.search(ask))
-        items.append({
+        return {
             "board": slug,
             "id": r["id"],
             "title": r["title"],
@@ -282,11 +329,19 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> tuple[list[dict[str, 
             "comments": int(r["comments"] or 0),
             "human_hint": hinted,
             "priority": r["priority"],
-        })
-    # Real owner asks first (framed — the nag would send these), then parks that merely
-    # mention a human, then the rest; newest first inside each bucket.
-    items.sort(key=lambda i: (0 if i["framed"] else (1 if i["human_hint"] else 2), -(i["age_seconds"] or 0)))
-    return items, int((total["c"] if total else 0) or 0)
+        }
+
+    framed = [item(i) for i in framed_ids]
+    parked = [item(i) for i in preview_ids if i not in set(framed_ids)]
+    framed.sort(key=lambda i: -(i["age_seconds"] or 0))
+    parked.sort(key=lambda i: (0 if i["human_hint"] else 1, -(i["age_seconds"] or 0)))
+    return {
+        "framed": framed,
+        "framed_total": len(framed),
+        "parked": parked,
+        "parked_total": len(rows) - len(framed),
+        "total": len(rows),
+    }
 
 
 def _board_summary(slug: str, db: str, pulse_from: int) -> dict[str, Any]:
@@ -363,15 +418,16 @@ def overview(awaiting_limit: int = Query(25, ge=1, le=200)):
     pulse_from = now - 12 * 3600
     boards = _boards()
     summaries = [_board_summary(b["slug"], b["path"], pulse_from) for b in boards]
-    awaiting: list[dict[str, Any]] = []
+    need_you: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
     awaiting_total = 0
     for b in boards:
-        items, total = _awaiting_for_board(b["slug"], b["path"], awaiting_limit)
-        awaiting.extend(items)
-        awaiting_total += total
-    awaiting.sort(key=lambda i: (0 if i["framed"] else (1 if i["human_hint"] else 2), -(i["age_seconds"] or 0)))
-    need_you = [i for i in awaiting if i["framed"]]
-    parked = [i for i in awaiting if not i["framed"]]
+        part = _awaiting_for_board(b["slug"], b["path"], awaiting_limit)
+        need_you.extend(part["framed"])
+        parked.extend(part["parked"])
+        awaiting_total += part["total"]
+    need_you.sort(key=lambda i: -(i["age_seconds"] or 0))
+    parked.sort(key=lambda i: (0 if i["human_hint"] else 1, -(i["age_seconds"] or 0)))
     in_flight = [c for s in summaries for c in s["running"]]
     recent_done = [c for s in summaries for c in s["recent_done"]]
     recent_done.sort(key=lambda c: c["completed_at"] or "", reverse=True)
@@ -388,9 +444,9 @@ def overview(awaiting_limit: int = Query(25, ge=1, le=200)):
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "boards": summaries,
         "awaiting": {
-            "framed": need_you[:awaiting_limit],
+            "framed": need_you,
             "framed_total": len(need_you),
-            "parked": parked[: max(0, awaiting_limit - len(need_you))],
+            "parked": parked,
             "parked_total": max(0, awaiting_total - len(need_you)),
             "total": awaiting_total,
         },
