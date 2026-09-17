@@ -45,7 +45,7 @@
       title: "Your attention",
       sub: "asks filed in the last " + d.window_days + " days, per lane, and what happened next",
       right: h(Pill, { kind: d.owner_answers ? "" : "mc-pill-warn" },
-        num(d.owner_answers) + " commented by you")
+        num(d.owner_answers) + " owner comments")
     },
       h(HBars, { rows: rows }),
       h("div", { className: "mc-row-m" },
@@ -74,7 +74,10 @@
       h("div", { className: "mc-row-m" },
         h("span", null, "you answered " + num(d.owner_answered) + " of " + num(d.filed) + " (" + pct(d.owner_answer_rate) + ")"),
         h("span", null, "median " + dur(d.owner_median_wait_s) + " · p90 " + dur(d.owner_p90_wait_s)),
-        h("span", null, "timed on " + num(d.owner_measured) + " of " + num(d.owner_answers) + " comments you wrote")),
+        h("span", null, "timed on " + num(d.owner_measured) + " of " + num(d.owner_answers) + " owner comments")),
+      h("div", { className: "mc-row-m" },
+        "An owner comment is a comment authored " + ((d.owner_authors || ["jesse"]).join(", ")) +
+        ": Mission Control's own answer button (jesse), the verbatim chat recorder (owner), and the hand-recorded path (owner-answer). A comment by the owning lane re-opening its own card is NOT counted. Mission Control answers only exist from 2026-09-17 ~02:00Z, so any window starting earlier reports a floor."),
       (d.lanes || []).length > lanes.length
         ? h("div", { className: "mc-row-m" }, (d.lanes.length - lanes.length) + " lanes with fewer asks not shown")
         : null);
@@ -122,7 +125,7 @@
       h(Stat, { k: "re-opened / filed", v: pct(a ? a.answer_rate : null),
                 n: a ? num(a.answered) + " of " + num(a.filed) + " asks came back" : "measuring…" }),
       h(Stat, { k: "answered by you / 7d", v: num(a ? a.owner_answered : null),
-                n: a ? "of " + num(a.filed) + " asks · " + num(a.owner_answers) + " comments by you · median " + mins(a.owner_median_wait_s) : "measuring…",
+                n: a ? "of " + num(a.filed) + " asks · " + num(a.owner_answers) + " owner comments (" + ((a.owner_authors || ["jesse"]).join(" / ")) + ") · median " + mins(a.owner_median_wait_s) : "measuring…",
                 tone: (a && a.filed && !a.owner_answered) ? "warn" : null }));
 
     var pulse = h(Panel, { title: "Live pulse", sub: "non-heartbeat events per 10 minutes, last 2 hours" },

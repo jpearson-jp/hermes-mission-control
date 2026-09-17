@@ -757,14 +757,14 @@ function AttentionPanel() {
       jsxs('div', { className: 'mc-row-m', children: [
         jsx('span', { children: `${d.filed} asks filed` }),
         jsx('span', { children: `${d.answered} re-opened after parking` }),
-        jsx('span', { children: `${d.owner_answers} commented on by you` }),
+        jsx('span', { children: `${d.owner_answers} owner comments (${(d.owner_authors || ['jesse']).join(' / ')})` }),
         jsx('span', { children: `you answered ${d.owner_answered} of them (${d.owner_answer_rate == null ? '—' : Math.round(d.owner_answer_rate * 100) + '%'}) · median ${fmtAge(d.owner_median_wait_s)}` }),
         jsx('span', { children: `median wait ${fmtAge(d.median_wait_s)} · p90 ${fmtAge(d.p90_wait_s)}` }),
         jsx('span', { children: `${d.still_open} still open · oldest ${fmtAge(d.oldest_open_s)}` })
       ] }),
-      jsx('div', { className: 'mc-row-m', children: 'Read the two columns separately: a card re-opened without a comment from you was usually resolved by its own lane (superseded, re-typed, or handed on), not answered by you.' }),
+      jsx('div', { className: 'mc-row-m', children: 'Read the two columns separately: a card re-opened without a comment from you was usually resolved by its own lane (superseded, re-typed, or handed on), not answered by you. An owner comment is one authored ' + ((d.owner_authors || ['jesse']).join(', ')) + ' — Mission Control\'s answer button, the verbatim chat recorder, and the hand-recorded path; a lane re-opening its own card is not counted. Mission Control answers only exist from 2026-09-17 ~02:00Z, so a window starting earlier reports a floor.' }),
       lanes.length
-        ? jsx(HBars, { rows: lanes.map(l => ({ label: l.lane, value: l.filed, cls: 'mc-c-3', sub: `→ ${l.answered}` })) })
+        ? jsx(HBars, { rows: lanes.map(l => ({ label: l.lane, value: l.filed, cls: 'mc-c2', sub: `→ ${l.answered}` })) })
         : jsx(EmptyState, { title: 'no asks in this window' }),
       lanes.length
         ? jsxs('div', { className: 'mc-row-m', children: ['median wait: '].concat(lanes.map(l => jsx('span', { children: `${l.lane} ${fmtAge(l.median_s)}` }, l.lane))) })

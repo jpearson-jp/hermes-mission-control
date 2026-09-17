@@ -1229,6 +1229,21 @@ def assign(body: AssignBody):
     return {"ok": True, "task_id": body.task_id, "assignee": (after.assignee if after else who)}
 
 
+#: Authors under which an owner answer is recorded, MEASURED across the live boards 2026-09-17.
+#: There are three deliberate recorders and picking one of them understates the owner by more than
+#: half — the first cut of this route keyed on 'jesse' alone and read 6 of 582 asks (1.0%) while the
+#: same window carries the other two:
+#:   * 'jesse'        — this plugin's own POST /answer and POST /comment (dashboard-typed answers);
+#:   * 'owner'        — ~/.hermes/scripts/hermes-decision-answers.py, which records the owner's chat
+#:                      reply verbatim as "**OWNER'S ANSWER, recorded verbatim.**";
+#:   * 'owner-answer' — the same pattern written by hand/earlier lanes ("## OWNER DECIDED … verbatim").
+#: NOT counted: 'owner-request' — measured as a swarm blackboard topology dump, not an answer at all.
+#: The caller gets the list back as ``owner_authors`` so the number can never be read as wider than it
+#: is; a comment under any other author (i.e. the ordinary case, a lane re-opening its own card) is
+#: deliberately NOT an owner answer.
+_OWNER_AUTHORS = ("jesse", "owner", "owner-answer")
+
+
 @router.get("/attention")
 def attention(days: int = Query(7, ge=1, le=90)):
     """How the owner-ask pipeline actually performs: filed, answered, and how long each waited.
@@ -1238,21 +1253,30 @@ def attention(days: int = Query(7, ge=1, le=90)):
     * ``median_wait_s`` pairs each ``blocked`` (needs_input) event with the first ``unblocked`` event
       after it on the same card — that interval is the real answer latency **whoever did the
       answering**, i.e. how long the ask waited before the estate moved on.
-    * ``owner_median_wait_s`` pairs the same park with the first comment authored ``jesse`` after it
-      (the dashboard's own answer path) — how long the ask waited on the OWNER specifically. Its
-      denominator is ``owner_answered``, never ``answered``: a park can be re-opened by the filing
-      lane and never touched by the owner at all, and reporting the owner's latency against the
-      estate's answer count would overstate the owner's throughput.
+    * ``owner_median_wait_s`` pairs the same park with the first comment authored by the OWNER after
+      it — how long the ask waited on the owner specifically. Its denominator is ``owner_answered``,
+      never ``answered``: a park can be re-opened by the filing lane and never touched by the owner at
+      all, and reporting the owner's latency against the estate's answer count would overstate the
+      owner's throughput.
 
-    ``owner_answers`` is the raw count of comments authored ``jesse`` in the window (the floor under
+    ``owner_answers`` is the raw count of owner comments in the window (the floor under
     ``owner_answered``: an owner comment that is not tied to a park still counts there). An ask counts
     in the window it was FILED in, so a park from before the window answered inside it is not counted
-    a second time.
+    a second time. Because this plugin's answer button only shipped 2026-09-17 ~02:00Z, the
+    'jesse'-authored part of the window is a floor: owner answers before that were recorded by the
+    other two recorders.
+
+    THE POPULATION IS NAMED, NOT ASSUMED: an owner comment is a comment under one of
+    ``_OWNER_AUTHORS``, returned to the caller as ``owner_authors``. This measures "answered by the
+    owner, by any recorded path", which is the honest reading of the card's question ("how long do MY
+    asks wait") — it is NOT "answered through this dashboard", and a surface that labels it that way
+    is wrong.
     """
     days = _int_or_none(days) or 7
     since = _now() - days * 86400
     now = _now()
     filed = answered = owner_answers = owner_answered = 0
+    owner_by_author: dict[str, int] = {}
     latencies: list[int] = []
     owner_latencies: list[int] = []
     lanes: dict[str, dict[str, Any]] = {}
@@ -1288,8 +1312,10 @@ def attention(days: int = Query(7, ge=1, le=90)):
                     entry["answered"] += 1
                     entry["_lat"].append(ts - b_at)
             owner_done: set[str] = set()
-            for r in _q(conn, "SELECT task_id, created_at FROM task_comments "
-                              "WHERE author = 'jesse' AND created_at >= ? ORDER BY created_at", (since,)):
+            _ph = ", ".join("?" * len(_OWNER_AUTHORS))
+            for r in _q(conn, f"SELECT task_id, created_at FROM task_comments "
+                              f"WHERE author IN ({_ph}) AND created_at >= ? ORDER BY created_at",
+                        tuple(_OWNER_AUTHORS) + (since,)):
                 tid, ts = r["task_id"], _int_or_none(r["created_at"])
                 parked = blocks.get(tid)
                 if tid in owner_done or not parked or not ts or ts < parked:
@@ -1300,9 +1326,12 @@ def attention(days: int = Query(7, ge=1, le=90)):
                 entry = lane(owners.get(tid))
                 entry["owner_answered"] += 1
                 entry["_owner"].append(ts - parked)
-            for r in _q(conn, "SELECT COUNT(*) c FROM task_comments WHERE author = 'jesse' AND created_at >= ?",
-                        (since,)):
-                owner_answers += int(r["c"] or 0)
+            for r in _q(conn, f"SELECT author, COUNT(*) c FROM task_comments "
+                              f"WHERE author IN ({_ph}) AND created_at >= ? GROUP BY author",
+                        tuple(_OWNER_AUTHORS) + (since,)):
+                n = int(r["c"] or 0)
+                owner_answers += n
+                owner_by_author[str(r["author"])] = owner_by_author.get(str(r["author"]), 0) + n
             for r in _q(conn, "SELECT id, created_at FROM tasks "
                               "WHERE block_kind='needs_input' AND status IN ('blocked','triage')"):
                 open_count += 1
@@ -1325,6 +1354,8 @@ def attention(days: int = Query(7, ge=1, le=90)):
         "p90_wait_s": _pct(sorted(latencies), 0.9),
         "measured": len(latencies),
         "owner_answered": owner_answered,
+        "owner_authors": list(_OWNER_AUTHORS),
+        "owner_answers_by_author": owner_by_author,
         "owner_answer_rate": round(owner_answered / filed, 3) if filed else None,
         "owner_median_wait_s": _pct(sorted(owner_latencies), 0.5),
         "owner_p90_wait_s": _pct(sorted(owner_latencies), 0.9),
