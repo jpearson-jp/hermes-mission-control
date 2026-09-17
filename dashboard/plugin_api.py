@@ -3,11 +3,12 @@
 Reads (cheap, read-only SQLite over every kanban board + every profile's cron store):
 what is running, what is parked on Jesse, what shipped today, what is scheduled.
 
-Writes are exactly two owner actions, both routed through ``hermes_cli.kanban_db`` — the
+Writes are exactly three owner actions, all routed through ``hermes_cli.kanban_db`` — the
 same code path the CLI and the bundled kanban plugin use, so the surfaces cannot drift:
 
     POST /answer   comment on a card as the owner, then (by default) ``unblock_task`` it
     POST /comment  comment on a card as the owner, no state change
+    POST /assign   give an ownerless card a real lane (``assign_task``, so the event is recorded)
 
 The "waiting on you" list uses the SAME framing contract as ``hermes-decision-nag.py``: a
 comment containing ``## OPTIONS FOR THE OWNER``, 2-4 contiguous numbered options, and a
@@ -77,9 +78,29 @@ def _hermes_home() -> Path:
 
 
 def _boards() -> list[dict[str, Any]]:
-    """Every kanban board on this box, newest activity last (slug + display title)."""
-    root = _hermes_home() / "kanban" / "boards"
+    """Every kanban board on this box: ``kanban_db.list_boards`` order (``default`` first).
+
+    Delegates to the library — the SAME enumeration the CLI and the bundled kanban plugin use —
+    instead of hand-rolling a scan of ``kanban/boards/*``. A hand-rolled scan silently dropped the
+    DEFAULT board, whose DB lives at ``<hermes home>/kanban.db`` (outside ``boards/``) and which is
+    a live board: measured 2026-09-17 it holds 127 cards, 3 running and 18 blocked, because the root
+    profile's cron jobs file their work there. Every page on this plugin was blind to all of it.
+    The dir scan is kept as a fallback only.
+    """
     out: list[dict[str, Any]] = []
+    try:
+        entries = kanban_db.list_boards(include_archived=False)
+    except Exception:  # never take the dashboard down over an enumeration quirk
+        log.warning("kanban_db.list_boards failed; falling back to the boards/ dir scan", exc_info=True)
+        entries = []
+    for e in entries:
+        db = e.get("db_path")
+        if not db or not Path(db).is_file():
+            continue
+        out.append({"slug": e["slug"], "title": e.get("name") or e["slug"], "path": str(db)})
+    if out:
+        return out
+    root = _hermes_home() / "kanban" / "boards"
     if not root.is_dir():
         return out
     for d in sorted(root.iterdir()):
@@ -1106,23 +1127,61 @@ def since(ts: int = Query(..., ge=0)):
     }
 
 
+#: A card in one of these states is work somebody should be doing or deciding about right now.
+#: ``running``/``done``/``archived`` are excluded: running has a claim, the others are behind us.
+_ACTIONABLE_STATUSES = ("todo", "ready", "triage", "blocked")
+
+
+def _lane_checker():
+    """``callable(assignee) -> bool``: is this assignee a real lane? ``None`` when unknowable.
+
+    Grounded in ``hermes_cli.profiles.profile_exists`` — the same predicate the dispatcher uses to
+    decide whether it may spawn the assignee (``kanban_db_dispatch`` sends non-profile assignees to
+    its ``skipped_nonspawnable`` bucket). ``None`` means the profile list could not be read, and the
+    caller must then report only the cards that are unambiguously ownerless (blank assignee) rather
+    than guessing which names are real.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        log.warning("hermes_cli.profiles unavailable: unowned reports blank assignees only", exc_info=True)
+        return None
+    return profile_exists
+
+
 @router.get("/unowned")
 def unowned(limit: int = Query(60, ge=1, le=400)):
-    """Work nobody is on: cards with no assignee, oldest first. The other half of 'too many things'."""
+    """Work nobody is on: no assignee at all, or an assignee that is not a real lane.
+
+    Two ways a card ends up ownerless and only the first is obvious. The second is the quieter one:
+    the ``assignee`` column names something that is not a profile (``owner-request``, a typo, a
+    retired bot), so the dispatcher refuses to spawn it and the card sits in ``ready`` forever.
+    Both are listed, with ``reason`` saying which, so the queue is actionable by reading alone.
+    """
     limit = _int_or_none(limit) or 60
+    is_lane = _lane_checker()
     now = _now()
     items: list[dict[str, Any]] = []
     for b in _boards():
         with closing(_ro(b["path"])) as conn:
-            for r in _q(conn, """
-                SELECT id, title, status, COALESCE(block_kind,'') kind, created_at, priority
+            for r in _q(conn, f"""
+                SELECT id, title, status, COALESCE(block_kind,'') kind, created_at, priority,
+                       COALESCE(TRIM(assignee),'') assignee
                   FROM tasks
-                 WHERE (assignee IS NULL OR TRIM(assignee) = '') AND status IN ('todo','ready','triage','blocked')
-                 ORDER BY created_at ASC LIMIT ?
-            """, (limit,)):
+                 WHERE status IN ({", ".join("?" * len(_ACTIONABLE_STATUSES))})
+                 ORDER BY created_at ASC
+            """, _ACTIONABLE_STATUSES):
+                who = r["assignee"]
+                if who:
+                    if is_lane is None or is_lane(who):
+                        continue  # a real lane owns it
+                    reason = f"assignee {who!r} is not a profile"
+                else:
+                    reason = "no assignee"
                 items.append({
                     "board": b["slug"], "board_title": b["title"], "id": r["id"], "title": r["title"],
                     "status": r["status"], "kind": r["kind"], "priority": r["priority"],
+                    "assignee": who or None, "reason": reason,
                     "age_seconds": now - (_int_or_none(r["created_at"]) or now),
                 })
     items.sort(key=lambda i: -(i["age_seconds"] or 0))
@@ -1130,7 +1189,9 @@ def unowned(limit: int = Query(60, ge=1, le=400)):
     for i in items:
         by_board[i["board_title"]] = by_board.get(i["board_title"], 0) + 1
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "total": len(items),
-            "by_board": by_board, "items": items[:limit]}
+            "shown": len(items[:limit]), "truncated": len(items) > limit,
+            "non_lane_total": sum(1 for i in items if i["assignee"]),
+            "lanes_known": is_lane is not None, "by_board": by_board, "items": items[:limit]}
 
 
 class AssignBody(BaseModel):
@@ -1142,14 +1203,26 @@ class AssignBody(BaseModel):
 @router.post("/assign")
 def assign(body: AssignBody):
     """Give a card an owner, through ``kanban_db.assign_task`` (the same path the CLI and the bundled
-    kanban plugin use, so the assignment is recorded as an event like any other)."""
+    kanban plugin use, so the assignment is recorded as an 'assigned' event like any other).
+
+    The lane is checked first, and that check is the whole point of the button: the dispatcher refuses
+    to spawn an assignee that is not a profile, so a typo here would park the card in ``ready``
+    forever — recreating, one click at a time, the defect this queue exists to surface. A card that is
+    running under a claim is refused by ``assign_task`` itself; that is a 409, not a 500.
+    """
     who = (body.assignee or "").strip()
     if not who:
         raise HTTPException(status_code=400, detail="assignee required")
+    is_lane = _lane_checker()
+    if is_lane is not None and not is_lane(who):
+        raise HTTPException(status_code=400, detail=f"{who!r} is not a profile on this box")
     with closing(_write_conn(body.board)) as conn:
         if kanban_db.get_task(conn, body.task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {body.task_id} not found")
-        ok = kanban_db.assign_task(conn, body.task_id, who)
+        try:
+            ok = kanban_db.assign_task(conn, body.task_id, who)
+        except RuntimeError as exc:  # claimed + running: assign_task refuses to yank it
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(status_code=409, detail="assign refused (state changed?)")
         after = kanban_db.get_task(conn, body.task_id)
