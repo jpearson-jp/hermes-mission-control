@@ -33,7 +33,7 @@ build_one() {
               desc="Every decision parked on Jesse: the ask, the options, and the bot's recommendation — answerable in place, with the card id and a chat handoff on every row." ;;
     insights) label="Insights";       icon="BarChart3"; path="/insights";      position="after:waiting-on-me"
               tpl="manifest.json"
-              desc="The estate at a glance: throughput, what state every card is in, what is stuck and for how long, who is working, what is failing, and schedule health." ;;
+              desc="The estate at a glance: throughput, what state every card is in, what is stuck and for how long, who is working, what is failing, schedule health — and how the ask pipeline performs: asks filed per lane, how many came back, how long each waited, and how many the owner answered himself." ;;
   esac
 
   mkdir -p "$dir/dashboard/dist"

@@ -1233,23 +1233,36 @@ def assign(body: AssignBody):
 def attention(days: int = Query(7, ge=1, le=90)):
     """How the owner-ask pipeline actually performs: filed, answered, and how long each waited.
 
-    Pairs each ``blocked`` (needs_input) event with the first ``unblocked`` event after it on the same
-    card — that interval is the real answer latency, whoever did the answering. ``owner_answers``
-    counts comments authored ``jesse`` (the dashboard's answer path), so a lane that files asks and
-    gets answers is distinguishable from one that files asks into a void.
+    Two latencies, deliberately separate, because they answer two different questions:
+
+    * ``median_wait_s`` pairs each ``blocked`` (needs_input) event with the first ``unblocked`` event
+      after it on the same card — that interval is the real answer latency **whoever did the
+      answering**, i.e. how long the ask waited before the estate moved on.
+    * ``owner_median_wait_s`` pairs the same park with the first comment authored ``jesse`` after it
+      (the dashboard's own answer path) — how long the ask waited on the OWNER specifically. Its
+      denominator is ``owner_answered``, never ``answered``: a park can be re-opened by the filing
+      lane and never touched by the owner at all, and reporting the owner's latency against the
+      estate's answer count would overstate the owner's throughput.
+
+    ``owner_answers`` is the raw count of comments authored ``jesse`` in the window (the floor under
+    ``owner_answered``: an owner comment that is not tied to a park still counts there). An ask counts
+    in the window it was FILED in, so a park from before the window answered inside it is not counted
+    a second time.
     """
     days = _int_or_none(days) or 7
     since = _now() - days * 86400
     now = _now()
-    filed = answered = owner_answers = 0
+    filed = answered = owner_answers = owner_answered = 0
     latencies: list[int] = []
+    owner_latencies: list[int] = []
     lanes: dict[str, dict[str, Any]] = {}
     open_count = 0
     oldest_open: Optional[int] = None
 
     def lane(name: Any) -> dict[str, Any]:
         key = str(name or "unassigned")
-        return lanes.setdefault(key, {"lane": key, "filed": 0, "answered": 0, "_lat": []})
+        return lanes.setdefault(
+            key, {"lane": key, "filed": 0, "answered": 0, "owner_answered": 0, "_lat": [], "_owner": []})
 
     for b in _boards():
         with closing(_ro(b["path"])) as conn:
@@ -1274,6 +1287,19 @@ def attention(days: int = Query(7, ge=1, le=90)):
                     entry = lane(owners.get(tid))
                     entry["answered"] += 1
                     entry["_lat"].append(ts - b_at)
+            owner_done: set[str] = set()
+            for r in _q(conn, "SELECT task_id, created_at FROM task_comments "
+                              "WHERE author = 'jesse' AND created_at >= ? ORDER BY created_at", (since,)):
+                tid, ts = r["task_id"], _int_or_none(r["created_at"])
+                parked = blocks.get(tid)
+                if tid in owner_done or not parked or not ts or ts < parked:
+                    continue  # not a park in this window, or a comment made before it
+                owner_done.add(tid)  # ORDER BY created_at: the first one wins
+                owner_answered += 1
+                owner_latencies.append(ts - parked)
+                entry = lane(owners.get(tid))
+                entry["owner_answered"] += 1
+                entry["_owner"].append(ts - parked)
             for r in _q(conn, "SELECT COUNT(*) c FROM task_comments WHERE author = 'jesse' AND created_at >= ?",
                         (since,)):
                 owner_answers += int(r["c"] or 0)
@@ -1286,6 +1312,7 @@ def attention(days: int = Query(7, ge=1, le=90)):
 
     for entry in lanes.values():
         entry["median_s"] = _pct(sorted(entry.pop("_lat")), 0.5)
+        entry["owner_median_s"] = _pct(sorted(entry.pop("_owner")), 0.5)
     ordered = sorted(lanes.values(), key=lambda e: (-(e["filed"]), e["lane"]))
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1297,6 +1324,11 @@ def attention(days: int = Query(7, ge=1, le=90)):
         "median_wait_s": _pct(sorted(latencies), 0.5),
         "p90_wait_s": _pct(sorted(latencies), 0.9),
         "measured": len(latencies),
+        "owner_answered": owner_answered,
+        "owner_answer_rate": round(owner_answered / filed, 3) if filed else None,
+        "owner_median_wait_s": _pct(sorted(owner_latencies), 0.5),
+        "owner_p90_wait_s": _pct(sorted(owner_latencies), 0.9),
+        "owner_measured": len(owner_latencies),
         "still_open": open_count,
         "oldest_open_s": (now - oldest_open) if oldest_open else None,
         "lanes": ordered,

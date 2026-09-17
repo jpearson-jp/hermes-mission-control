@@ -1,5 +1,6 @@
 /* Mission Control — Insights: the estate at a glance. Throughput, what is stuck, who is working,
- * what is failing, and how fast work actually moves. Hand-rolled SVG/CSS, theme-aware. */
+ * what is failing, how fast work actually moves, and how the ask pipeline performs. Hand-rolled
+ * SVG/CSS, theme-aware. */
 
   var STATUS_CLS = {
     running: "mc-c-run", ready: "mc-c-run", todo: "mc-c-todo", triage: "mc-c-triage",
@@ -11,14 +12,84 @@
     return dur(sec);
   }
 
+  function pct(frac) {
+    if (frac == null) return "—";
+    return Math.round(frac * 100) + "%";
+  }
+
+  /* The ask pipeline, in the card's own terms: how many asks get filed, how many come back, how long
+   * each waits, and how many of them the owner himself touched. Two columns on purpose — a card
+   * re-opened WITHOUT a comment from the owner was usually resolved by its own lane (superseded,
+   * re-typed, handed on), so "re-opened" is flow and "commented on by you" is the owner's own
+   * throughput. Showing only the first would flatter the pipeline; only the second would call a
+   * healthy estate dead. */
+  function AttentionPanel(props) {
+    var d = props.data;
+    if (!d) return h(Panel, { title: "Your attention", sub: "asks filed, and what happened next" },
+      h("div", { className: "mc-muted" }, "measuring the ask pipeline…"));
+
+    var lanes = (d.lanes || []).slice(0, 12);
+    if (!d.filed) {
+      return h(Panel, { title: "Your attention", sub: "asks filed in the last " + d.window_days + " days" },
+        h("div", { className: "mc-muted" }, "No ask was filed as needs_input in this window."));
+    }
+
+    var rows = lanes.map(function (l) {
+      return {
+        label: l.lane, value: l.filed, cls: "mc-c-3", sub: l.answered ? "→ " + l.answered : "",
+        title: l.lane + ": " + l.filed + " filed, " + l.answered + " re-opened, median wait " + dur(l.median_s)
+      };
+    });
+
+    return h(Panel, {
+      title: "Your attention",
+      sub: "asks filed in the last " + d.window_days + " days, per lane, and what happened next",
+      right: h(Pill, { kind: d.owner_answers ? "" : "mc-pill-warn" },
+        num(d.owner_answers) + " commented by you")
+    },
+      h(HBars, { rows: rows }),
+      h("div", { className: "mc-row-m" },
+        h("span", null, "bar = asks filed"),
+        h("span", null, "→ n = re-opened after parking"),
+        h("span", null, "median wait to re-open " + dur(d.median_wait_s)),
+        h("span", null, "p90 " + dur(d.p90_wait_s)),
+        h("span", null, "timed on " + num(d.measured) + " of " + num(d.filed))),
+      h("div", { className: "mc-row-m" },
+        "Read the two columns separately: a card re-opened without a comment from you was usually resolved by its own lane (superseded, re-typed, or handed on), not answered by you."),
+      h("table", { className: "mc-table" },
+        h("thead", null, h("tr", null,
+          h("th", null, "lane"), h("th", null, "filed"), h("th", null, "re-opened"),
+          h("th", null, "median wait"), h("th", null, "you"))),
+        h("tbody", null, lanes.map(function (l) {
+          return h("tr", { key: l.lane },
+            h("td", null, l.lane),
+            h("td", null, num(l.filed)),
+            h("td", null, l.answered ? num(l.answered) : "—"),
+            h("td", null, h(Pill, { kind: (l.median_s != null && l.median_s > 86400) ? "mc-pill-warn" : "" }, dur(l.median_s))),
+            h("td", null, h("span", {
+              className: l.owner_answered ? "" : "mc-muted",
+              title: l.owner_answered ? "you answered " + l.owner_answered + " of them, median wait " + dur(l.owner_median_s) : "no ask from this lane has an answer from you in the window"
+            }, l.owner_answered ? num(l.owner_answered) : "—")));
+        }))),
+      h("div", { className: "mc-row-m" },
+        h("span", null, "you answered " + num(d.owner_answered) + " of " + num(d.filed) + " (" + pct(d.owner_answer_rate) + ")"),
+        h("span", null, "median " + dur(d.owner_median_wait_s) + " · p90 " + dur(d.owner_p90_wait_s)),
+        h("span", null, "timed on " + num(d.owner_measured) + " of " + num(d.owner_answers) + " comments you wrote")),
+      (d.lanes || []).length > lanes.length
+        ? h("div", { className: "mc-row-m" }, (d.lanes.length - lanes.length) + " lanes with fewer asks not shown")
+        : null);
+  }
+
   function InsightsPage() {
     var poll = usePoll("/insights", 60000);
+    var att = usePoll("/attention?days=7", 120000);
     var [detail, setDetail, detailNode] = useDetail();
     var d = poll.state.data;
 
     if (poll.state.error && !d) return h("div", { className: "mc-root" }, h("div", { className: "mc-err" }, "backend error: " + poll.state.error));
     if (!d) return h("div", { className: "mc-root" }, h("div", { className: "mc-muted" }, "measuring the estate…"));
 
+    var a = att.state.data || null;
     var sm = d.status_mix || {};
     var runs = d.runs || {};
     var cycle = d.cycle || {};
@@ -31,7 +102,7 @@
     }, h("div", { className: "mc-filter" },
       h("a", { className: "mc-btn", href: "/mission-control" }, "← Mission Control"),
       h("a", { className: "mc-btn", href: "/waiting-on-me" }, "Waiting on me →"),
-      h("button", { className: "mc-btn", onClick: poll.load }, "refresh")));
+      h("button", { className: "mc-btn", onClick: function () { poll.load(); att.load(); } }, "refresh")));
 
     var kpis = h("div", { className: "mc-stats" },
       h(Stat, { k: "running now", v: num(sm.running || 0), n: "cards with a live run", tone: "run" }),
@@ -42,7 +113,17 @@
       h(Stat, { k: "stuck", v: num(stuck.total), n: "blocked or triage", tone: "warn" }),
       h(Stat, { k: "waiting on you", v: num((d.awaiting || {}).framed || 0),
                 n: "framed asks · oldest " + mins((d.awaiting || {}).oldest_seconds),
-                tone: ((d.awaiting || {}).framed || 0) ? "warn" : null }));
+                tone: ((d.awaiting || {}).framed || 0) ? "warn" : null }),
+      h(Stat, { k: "asks filed / 7d", v: num(a ? a.filed : null),
+                n: a ? num(a.still_open) + " still open · " + num(a.answered) + " re-opened" : "measuring…",
+                tone: (a && a.still_open) ? "warn" : null }),
+      h(Stat, { k: "median ask wait", v: mins(a ? a.median_wait_s : null),
+                n: a ? "p90 " + mins(a.p90_wait_s) + " · timed on " + num(a.measured) : "measuring…" }),
+      h(Stat, { k: "re-opened / filed", v: pct(a ? a.answer_rate : null),
+                n: a ? num(a.answered) + " of " + num(a.filed) + " asks came back" : "measuring…" }),
+      h(Stat, { k: "answered by you / 7d", v: num(a ? a.owner_answered : null),
+                n: a ? "of " + num(a.filed) + " asks · " + num(a.owner_answers) + " comments by you · median " + mins(a.owner_median_wait_s) : "measuring…",
+                tone: (a && a.filed && !a.owner_answered) ? "warn" : null }));
 
     var pulse = h(Panel, { title: "Live pulse", sub: "non-heartbeat events per 10 minutes, last 2 hours" },
       h(Spark, { points: d.spark || [], height: 90, label: "estate activity" }));
@@ -155,6 +236,6 @@
       head, kpis,
       h("div", { className: "mc-grid" },
         h("div", { className: "mc-cards" }, pulse, throughput, stuckPanel, failPanel),
-        h("div", { className: "mc-cards" }, mix, kinds, people, schedPanel)),
+        h("div", { className: "mc-cards" }, h(AttentionPanel, { data: a }), mix, kinds, people, schedPanel)),
       detailNode);
   }
