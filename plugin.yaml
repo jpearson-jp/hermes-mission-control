@@ -1,0 +1,12 @@
+name: mission-control
+label: Mission Control
+kind: standalone
+version: 1.0.0
+description: >
+  One pane of glass over the estate, as a web-dashboard tab. Reads every kanban
+  board, every profile's cron store and the live run/event tables to show what
+  each bot is doing right now, what is parked on Jesse, what shipped today and
+  what is scheduled. Carries the two owner write actions back: answer a parked
+  decision (comment as the owner + re-open the card for dispatch) and comment
+  without changing state. Owner-side only; registers no agent tools and no hooks.
+author: Hermes Smith
