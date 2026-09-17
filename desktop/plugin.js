@@ -14,7 +14,7 @@
 import {
   Badge, Button, cn, EmptyState, ErrorState, GlyphSpinner, haptic, host,
   KEYBINDS_AREA, PALETTE_AREA, queryClient, relativeTime, ROUTES_AREA, SIDEBAR_NAV_AREA,
-  Separator, STATUSBAR_AREAS, Tip, useQuery
+  Separator, STATUSBAR_AREAS, Tip, TRANSCRIPT_DIRECTIVE_AREA, useQuery
 } from '@hermes/plugin-sdk'
 import { useEffect, useMemo, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -22,6 +22,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const ID = 'mission-control'
 const WAITING = '/mission-control'
 const INSIGHTS = '/mission-control/insights'
+const ESTATE = '/mission-control/estate'
 
 const CSS = `
 .mc-page{display:flex;flex-direction:column;gap:14px;padding:14px 16px 40px;height:100%;overflow:auto}
@@ -271,9 +272,83 @@ function AskRow({ item, onDone }) {
   ] })
 }
 
-// ctx owns the OS and clipboard doors; the ask row keeps module-level handles set on register so a
-// component deep in the tree never has to thread ctx through props.
+// ctx owns the OS, storage and clipboard doors; components deep in the tree use these module-level
+// handles so ctx never has to be threaded through props.
 let ctx_writeClipboard = () => Promise.resolve(false)
+let storage = { get: () => null, set: () => {}, remove: () => {} }
+
+const LAST_SEEN_KEY = 'ui.lastSeenAt'
+const ASKS_SEEN_KEY = 'ui.asksSeen'
+
+/** Read the previous visit's timestamp, then advance it — the delta panel is per-visit, not sticky. */
+function takeLastSeen() {
+  const previous = Number(storage.get(LAST_SEEN_KEY, 0)) || 0
+  storage.set(LAST_SEEN_KEY, Date.now())
+  return previous
+}
+
+/**
+ * Notify on NEWLY framed owner asks.
+ *
+ * `ctx.os.notify` fires only while Hermes is unfocused/backgrounded, so this is a "while you were
+ * away" signal rather than an in-app nag, and the app never steals focus (navigation only happens if
+ * the notification body is clicked). The first poll only records a baseline, so starting the app
+ * never fires a burst for asks that were already waiting.
+ */
+function startAskWatch(ctx) {
+  let stopped = false
+  async function tick() {
+    if (stopped) {
+      return
+    }
+    try {
+      const data = await rest('/waiting')
+      const framed = data?.framed || []
+      const seen = storage.get(ASKS_SEEN_KEY, null)
+      if (Array.isArray(seen)) {
+        const fresh = framed.filter(f => !seen.includes(f.id))
+        if (fresh.length) {
+          const first = fresh[0]
+          ctx.os.notify({
+            title: fresh.length === 1 ? 'A decision is waiting on you' : `${fresh.length} decisions are waiting on you`,
+            body: `${first.board_title || first.board} — ${String(first.title).slice(0, 130)}`,
+            activate: WAITING
+          })
+        }
+      }
+      storage.set(ASKS_SEEN_KEY, framed.map(f => f.id))
+    } catch {
+      // backend busy or unreachable this tick — the next one retries
+    }
+  }
+  const timer = setInterval(() => void tick(), 60000)
+  ctx.onDispose(() => {
+    stopped = true
+    clearInterval(timer)
+  })
+  void tick()
+}
+
+/**
+ * Dock the waiting list into the main workspace zone as a tab (feature-detected: older builds get a
+ * route navigation instead). Chosen over a permanently-registered pane because closing a plugin's
+ * ONLY pane disables the whole plugin — an on-demand workspace tab closes harmlessly.
+ */
+function openWaitingWorkspace() {
+  if (typeof host.openWorkspace === 'function') {
+    host.openWorkspace('waiting-on-me', {
+      title: 'Waiting on me',
+      minWidth: '460px',
+      render: () => jsx(WaitingWorkspace, {})
+    })
+    return
+  }
+  host.navigate(WAITING)
+}
+
+function invalidate() {
+  void queryClient.invalidateQueries({ queryKey: [ID] })
+}
 
 // ---------------------------------------------------------------- the main page
 
@@ -307,6 +382,7 @@ function MissionControlPage() {
       jsx('div', { className: 'mc-sec-s', children: `estate-wide · updated ${relativeTime(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(INSIGHTS), children: 'Insights →' }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(ESTATE), children: 'Estate →' }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: refresh, children: 'refresh' })
     ] }),
     jsxs('div', { className: 'mc-tiles', children: [
@@ -316,6 +392,7 @@ function MissionControlPage() {
       jsx(Tile, { k: 'capability blocks', v: fmtNum(t.blocked_capability), n: 'not waiting on input' }),
       jsx(Tile, { k: 'schedules failing', v: fmtNum((sched.failing || []).length), n: `${sched.enabled || 0} of ${sched.total || 0} enabled`, tone: (sched.failing || []).length ? 'warn' : undefined })
     ] }),
+    jsx(SincePanel, {}),
     jsxs('div', { className: 'mc-grid2', children: [
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: '14px' }, children: [
         jsx(Section, {
@@ -472,6 +549,173 @@ function InsightsPage() {
   ] })
 }
 
+// ---------------------------------------------------------------- the docked workspace tab
+
+function WaitingWorkspace() {
+  useCss()
+  const w = useRest('/waiting', 30000)
+  const d = w.data
+  if (w.isError) return jsx('div', { className: 'mc-page', children: jsx(ErrorState, { title: 'Mission Control backend unreachable', description: String(w.error?.message || w.error) }) })
+  if (!d) return jsx('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
+  const framed = d.framed || []
+  return jsxs('div', { className: 'mc-page', children: [
+    jsxs('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, children: [
+      jsx('div', { className: 'mc-sec-t', children: 'Waiting on me' }),
+      jsx('div', { className: 'mc-sec-s', children: `${framed.length} framed · ${d.totals?.parked || 0} other parks` }),
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: invalidate, children: 'refresh' })
+    ] }),
+    framed.length
+      ? framed.map(i => jsx(AskRow, { item: i, onDone: invalidate }, `${i.board}${i.id}`))
+      : jsx(EmptyState, { title: 'Nothing framed for you right now' })
+  ] })
+}
+
+// ---------------------------------------------------------------- since you last looked
+
+function SincePanel() {
+  const [delta, setDelta] = useState(null)
+  useEffect(() => {
+    const previous = takeLastSeen()
+    if (!previous) {
+      return
+    }
+    let alive = true
+    rest(`/since?ts=${previous}`)
+      .then(d => { if (alive) setDelta(d) })
+      .catch(() => { /* the panel is a nicety; never block the page on it */ })
+    return () => { alive = false }
+  }, [])
+  if (!delta) return null
+  const c = delta.counts || {}
+  if (!c.opened && !c.finished && !c.parked) return null
+  const parked = (delta.parked || []).slice(0, 6)
+  return jsx(Section, {
+    title: 'Since you last looked',
+    sub: delta.since ? `since ${relativeTime(delta.since)}` : undefined,
+    children: [
+      jsxs('div', { className: 'mc-row-m', children: [
+        jsx('span', { children: `${c.parked} newly parked on you` }),
+        jsx('span', { children: `${c.opened} cards opened` }),
+        jsx('span', { children: `${c.finished} cards finished` })
+      ] }),
+      parked.length
+        ? parked.map(p => jsxs('div', { className: 'mc-row', children: [
+            jsx('div', { className: 'mc-row-t', children: p.title }),
+            jsxs('div', { className: 'mc-row-m', children: [
+              jsx('span', { children: p.board_title || p.board }),
+              jsx('span', { children: p.assignee || '—' }),
+              jsx('span', { children: p.id })
+            ] })
+          ] }, `${p.board}${p.id}`))
+        : jsx('div', { className: 'mc-row-m', children: 'nothing was newly parked on you' })
+    ]
+  })
+}
+
+// ---------------------------------------------------------------- the estate: one row per bot
+
+function EstatePage() {
+  useCss()
+  const est = useRest('/estate', 60000)
+  const d = est.data
+  if (est.isError) return jsx('div', { className: 'mc-page', children: jsx(ErrorState, { title: 'Estate backend unreachable', description: String(est.error?.message || est.error) }) })
+  if (!d) return jsx('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
+
+  const t = d.totals || {}
+  const all = d.profiles || []
+  const scheduled = all.filter(p => p.jobs)
+  const working = all.filter(p => !p.jobs && (p.running || p.open || p.blocked))
+  const idle = all.filter(p => !p.jobs && !p.running && !p.open && !p.blocked)
+
+  const botRow = p => jsxs('div', { className: 'mc-row', children: [
+    jsxs('div', { className: 'mc-row-m', children: [
+      jsx('span', { className: p.jobs_failing ? 'mc-warn-text' : undefined, children: p.profile }),
+      p.jobs ? jsx('span', { children: `${p.jobs_enabled}/${p.jobs} jobs` }) : null,
+      p.jobs_failing ? jsx(Badge, { variant: 'outline', children: `${p.jobs_failing} failing` }) : null,
+      p.last_status ? jsx('span', { children: `last: ${p.last_status}` }) : null,
+      p.next_run_at ? jsx('span', { children: `next ${relativeTime(p.next_run_at)}` }) : null
+    ] }),
+    jsxs('div', { className: 'mc-row-m', children: [
+      jsx('span', { children: `${p.running} running` }),
+      jsx('span', { children: `${p.open} open` }),
+      jsx('span', { children: `${p.blocked} blocked` }),
+      jsx('span', { children: `${p.asks} needing input` }),
+      jsx('span', { children: `${p.done_window} done in window` })
+    ] }),
+    p.last_error ? jsx('div', { className: 'mc-ask', children: String(p.last_error).slice(0, 220) }) : null
+  ] }, p.profile)
+
+  return jsxs('div', { className: 'mc-page', children: [
+    jsxs('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, children: [
+      jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Estate' }),
+      jsx('div', { className: 'mc-sec-s', children: `every bot · window ${d.window_hours}h · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(WAITING), children: '← Mission Control' }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: invalidate, children: 'refresh' })
+    ] }),
+    jsxs('div', { className: 'mc-tiles', children: [
+      jsx(Tile, { k: 'profiles', v: fmtNum(t.profiles), n: `${fmtNum(t.with_schedule)} with a schedule` }),
+      jsx(Tile, { k: 'schedules failing', v: fmtNum(t.failing), n: 'bots with a red job', tone: t.failing ? 'warn' : undefined }),
+      jsx(Tile, { k: 'running', v: fmtNum(t.running), n: 'live card runs' }),
+      jsx(Tile, { k: 'needing input', v: fmtNum(t.asks), n: 'cards parked on a human' }),
+      jsx(Tile, { k: 'blocked', v: fmtNum(t.blocked), n: 'blocked across the estate' }),
+      jsx(Tile, { k: 'idle', v: fmtNum(idle.length), n: 'profiles with nothing on their plate' })
+    ] }),
+    jsx(Section, { title: 'Bots with a schedule', sub: `${scheduled.length} profiles`, children: scheduled.map(botRow) }),
+    jsx(Section, { title: 'Bots with a plate, no schedule', sub: `${working.length} profiles`, children: working.length ? working.map(botRow) : jsx(EmptyState, { title: 'none' }) }),
+    jsx(Section, { title: 'Idle', sub: `${idle.length} profiles — nothing scheduled, nothing assigned`, children: jsx('div', { className: 'mc-row-m', children: idle.map(p => jsx('span', { children: p.profile }, p.profile)) }) })
+  ] })
+}
+
+// ---------------------------------------------------------------- ::mc-card{id="…"} in a message
+
+function CardDirective({ attrs }) {
+  useCss()
+  const id = typeof attrs?.id === 'string' ? attrs.id.trim() : ''
+  const valid = /^t_[0-9a-z]{4,}$/i.test(id)
+  const q = useQuery({
+    queryKey: [ID, 'directive-card', id],
+    queryFn: () => rest(`/card_any?card_id=${encodeURIComponent(id)}`),
+    enabled: valid,
+    retry: 0,
+    staleTime: 15000
+  })
+  if (!valid) {
+    return jsx('div', { className: 'mc-row-m', children: 'Mission Control: ::mc-card needs a card id — e.g. ::mc-card{id="t_1b1e089a"}' })
+  }
+  if (q.isError) {
+    return jsx('div', { className: 'mc-row-m', children: `Mission Control: card ${id} not found on any board` })
+  }
+  if (!q.data) {
+    return jsxs('div', { className: 'mc-row-m', children: [jsx(GlyphSpinner, {}), ` loading ${id}…`] })
+  }
+  const d = q.data
+  const t = d.task || {}
+  if (d.frame?.framed) {
+    // an owner ask rendered inline: pick an option in the message itself
+    return jsx(AskRow, {
+      item: {
+        board: d.board, board_title: d.board_title, id: t.id, title: t.title, assignee: t.assignee,
+        status: t.status, ask: d.ask, options: d.frame.options, recommendation: d.frame.recommendation,
+        briefing: d.briefing, framed: true, hints: d.hints || [],
+        comments: (d.comments || []).length, age_seconds: null
+      },
+      onDone: invalidate
+    })
+  }
+  return jsxs('div', { className: 'mc-row', children: [
+    jsx('div', { className: 'mc-row-t', children: t.title }),
+    jsxs('div', { className: 'mc-row-m', children: [
+      jsx(Badge, { children: t.status }),
+      jsx('span', { children: d.board_title || d.board }),
+      jsx('span', { children: t.assignee || '—' }),
+      jsx('span', { children: t.id })
+    ] }),
+    d.ask ? jsx('div', { className: 'mc-ask', children: d.ask }) : null
+  ] })
+}
+
 // ---------------------------------------------------------------- the status-bar chip
 
 function WaitingChip() {
@@ -498,6 +742,8 @@ export default {
   register(ctx) {
     rest = (path, opts) => ctx.rest(path, opts)
     ctx_writeClipboard = text => ctx.os.writeClipboard(text)
+    storage = ctx.storage
+    startAskWatch(ctx)
 
     ctx.registerMany([
       { id: 'page', area: ROUTES_AREA, data: { path: WAITING }, render: () => jsx(MissionControlPage, {}) },
@@ -516,6 +762,29 @@ export default {
       {
         id: 'bind', area: KEYBINDS_AREA,
         data: { id: 'mission-control.open', label: 'Open Mission Control', category: 'Mission Control', defaults: ['mod+shift+m'], run: () => host.navigate(WAITING) }
+      },
+      { id: 'estate', area: ROUTES_AREA, data: { path: ESTATE }, render: () => jsx(EstatePage, {}) },
+      { id: 'nav-estate', area: SIDEBAR_NAV_AREA, data: { path: ESTATE, label: 'Estate', codicon: 'server-process' } },
+      {
+        id: 'workspace', area: PALETTE_AREA,
+        data: {
+          id: 'mission-control.workspace', label: 'Mission Control: open the waiting list as a tab',
+          keywords: ['mission', 'control', 'waiting', 'decisions', 'workspace'], run: () => openWaitingWorkspace()
+        }
+      },
+      {
+        id: 'workspace-bind', area: KEYBINDS_AREA,
+        data: {
+          id: 'mission-control.workspace', label: 'Open the waiting list as a workspace tab',
+          category: 'Mission Control', defaults: ['mod+shift+w'], run: () => openWaitingWorkspace()
+        }
+      },
+      {
+        // The agent renders a live card inline by writing a paragraph that is exactly
+        // ::mc-card{id="t_…"} — a framed owner ask arrives with its options as buttons, answerable
+        // from the message. Namespaced (mc-card) because first registration wins on a name.
+        id: 'directive', area: TRANSCRIPT_DIRECTIVE_AREA,
+        data: { name: 'mc-card', render: ({ attrs }) => jsx(CardDirective, { attrs }) }
       }
     ])
   }

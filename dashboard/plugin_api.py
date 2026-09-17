@@ -929,3 +929,148 @@ def boards():
         out.append({"slug": b["slug"], "title": b["title"], "counts": counts,
                     "total": sum(counts.values())})
     return {"boards": out}
+
+
+@router.get("/card_any")
+def card_any(card_id: str = Query(...)):
+    """Find a card by id on ANY board and return exactly the /card payload.
+
+    A bot writing the desktop's ``::card{id="…"}`` directive knows the card id but should not have to
+    know (or state) which board it lives on; this resolves it by searching every board.
+    """
+    found = None
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            if _q1(conn, "SELECT 1 FROM tasks WHERE id = ?", (card_id,)):
+                found = b
+                break
+    if not found:
+        raise HTTPException(status_code=404, detail=f"card {card_id} not found on any board")
+    return card(board=found["slug"], task_id=card_id)
+
+
+@router.get("/estate")
+def estate(hours: int = Query(24, ge=1, le=336)):
+    """Per-bot scoreboard: is its schedule healthy, what is it running, what is parked on its plate.
+
+    The union of every profile with a cron store, a running card, or an assigned card — so a bot with
+    no schedule but a full plate is still visible, and vice versa.
+    """
+    hours = _int_or_none(hours) or 24
+    since = _now() - hours * 3600
+    jobs_by_profile: dict[str, list[dict[str, Any]]] = {}
+    for job in _schedules()["jobs"]:
+        jobs_by_profile.setdefault(str(job["profile"]), []).append(job)
+
+    rows: dict[str, dict[str, Any]] = {}
+
+    def entry(name: str) -> dict[str, Any]:
+        return rows.setdefault(name, {
+            "profile": name, "jobs": 0, "jobs_enabled": 0, "jobs_failing": 0,
+            "last_status": None, "next_run_at": None, "last_error": None,
+            "running": 0, "open": 0, "blocked": 0, "asks": 0, "done_window": 0,
+        })
+
+    for profile, jobs in jobs_by_profile.items():
+        e = entry(profile)
+        e["jobs"] = len(jobs)
+        e["jobs_enabled"] = sum(1 for j in jobs if j["enabled"])
+        failing = [j for j in jobs if j["failure_streak"] > 0
+                   or (j["last_status"] and j["last_status"] not in ("ok", "silent"))]
+        e["jobs_failing"] = len(failing)
+        if failing:
+            worst = max(failing, key=lambda j: j["failure_streak"])
+            e["last_error"] = (worst.get("last_error") or "")[:240] or None
+            e["last_status"] = worst.get("last_status")
+        runs = [j for j in jobs if j.get("last_run_at")]
+        if runs:
+            newest = max(runs, key=lambda j: str(j["last_run_at"]))
+            e["last_status"] = e["last_status"] or newest.get("last_status")
+            e["last_run_at"] = newest.get("last_run_at")
+        nxt = sorted([j for j in jobs if j["enabled"] and j["next_run_at"]], key=lambda j: str(j["next_run_at"]))
+        e["next_run_at"] = nxt[0]["next_run_at"] if nxt else None
+
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            for r in _q(conn, """
+                SELECT assignee,
+                       SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) running,
+                       SUM(CASE WHEN status IN ('todo','ready','triage') THEN 1 ELSE 0 END) open,
+                       SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) blocked,
+                       SUM(CASE WHEN status IN ('blocked','triage') AND block_kind = 'needs_input' THEN 1 ELSE 0 END) asks,
+                       SUM(CASE WHEN status = 'done' AND completed_at >= ? THEN 1 ELSE 0 END) done_window
+                  FROM tasks WHERE assignee IS NOT NULL AND assignee != ''
+                 GROUP BY assignee
+            """, (since,)):
+                e = entry(str(r["assignee"]))
+                e["running"] += int(r["running"] or 0)
+                e["open"] += int(r["open"] or 0)
+                e["blocked"] += int(r["blocked"] or 0)
+                e["asks"] += int(r["asks"] or 0)
+                e["done_window"] += int(r["done_window"] or 0)
+
+    profiles_dir = _hermes_home() / "profiles"
+    if profiles_dir.is_dir():
+        for p in sorted(profiles_dir.iterdir()):
+            if p.is_dir() and not p.name.startswith("."):
+                entry(p.name)
+
+    items = sorted(rows.values(), key=lambda e: (-(e["jobs_failing"]), -(e["asks"]), -(e["running"]),
+                                                 -(e["blocked"]), e["profile"]))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": hours,
+        "profiles": items,
+        "totals": {
+            "profiles": len(items),
+            "with_schedule": sum(1 for e in items if e["jobs"]),
+            "failing": sum(1 for e in items if e["jobs_failing"]),
+            "running": sum(e["running"] for e in items),
+            "asks": sum(e["asks"] for e in items),
+            "blocked": sum(e["blocked"] for e in items),
+        },
+    }
+
+
+@router.get("/since")
+def since(ts: int = Query(..., ge=0)):
+    """What changed since *ts* — the 'since you last looked' panel.
+
+    Three movements only: cards opened, cards finished, and cards newly parked *on the owner*
+    (a newest blocked event with kind needs_input after ts). Everything else is noise here.
+    """
+    stamp = _int_or_none(ts) or 0
+    opened: list[dict[str, Any]] = []
+    finished: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            for r in _q(conn, """
+                SELECT id, title, assignee, created_at FROM tasks
+                 WHERE created_at >= ? ORDER BY created_at DESC LIMIT 40
+            """, (stamp,)):
+                opened.append({"board": b["slug"], "board_title": b["title"], "id": r["id"],
+                               "title": r["title"], "assignee": r["assignee"], "at": _iso(r["created_at"])})
+            for r in _q(conn, """
+                SELECT id, title, assignee, completed_at FROM tasks
+                 WHERE status = 'done' AND completed_at >= ? ORDER BY completed_at DESC LIMIT 40
+            """, (stamp,)):
+                finished.append({"board": b["slug"], "board_title": b["title"], "id": r["id"],
+                                 "title": r["title"], "assignee": r["assignee"], "at": _iso(r["completed_at"])})
+            for r in _q(conn, """
+                SELECT t.id, t.title, t.assignee, MAX(e.created_at) AS at
+                  FROM tasks t JOIN task_events e ON e.task_id = t.id
+                 WHERE e.kind = 'blocked' AND e.created_at >= ?
+                   AND t.status IN ('blocked','triage') AND t.block_kind = 'needs_input'
+                 GROUP BY t.id ORDER BY at DESC LIMIT 40
+            """, (stamp,)):
+                parked.append({"board": b["slug"], "board_title": b["title"], "id": r["id"],
+                               "title": r["title"], "assignee": r["assignee"], "at": _iso(r["at"])})
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "since": _iso(stamp),
+        "counts": {"opened": len(opened), "finished": len(finished), "parked": len(parked)},
+        "opened": opened,
+        "finished": finished,
+        "parked": parked,
+    }
