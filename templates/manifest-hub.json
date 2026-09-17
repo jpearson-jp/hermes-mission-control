@@ -1,0 +1,14 @@
+{
+  "name": "@NAME@",
+  "label": "@LABEL@",
+  "description": "@DESC@",
+  "icon": "@ICON@",
+  "version": "1.1.0",
+  "tab": {
+    "path": "@PATH@",
+    "position": "@POSITION@"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

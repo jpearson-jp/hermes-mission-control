@@ -1,14 +1,13 @@
 {
   "name": "mission-control",
   "label": "Mission Control",
-  "description": "One pane of glass over the estate: what every bot is doing right now, every project's board state, the decisions waiting on Jesse (with their options and the bot's recommendation, answerable in one click), the schedule, and today's shipped work.",
+  "description": "One pane of glass over the estate: what every bot is running now, every board's state, the decisions waiting on Jesse (options plus the bot's recommendation, answerable in place), today's shipped work and the schedule.",
   "icon": "Activity",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "tab": {
     "path": "/mission-control",
     "position": "after:kanban"
   },
-  "slots": [],
   "entry": "dist/index.js",
   "css": "dist/style.css",
   "api": "plugin_api.py"

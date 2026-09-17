@@ -706,6 +706,219 @@ def comment(body: CommentBody):
     return {"ok": True, "comment_id": cid}
 
 
+_AGING_BUCKETS = ((3600, "< 1h"), (6 * 3600, "1–6h"), (24 * 3600, "6–24h"),
+                  (3 * 86400, "1–3d"), (float("inf"), "> 3d"))
+
+
+def _bucketize(ages: list[int]) -> list[dict[str, Any]]:
+    out = [{"label": label, "count": 0} for _, label in _AGING_BUCKETS]
+    for age in ages:
+        for i, (limit, _label) in enumerate(_AGING_BUCKETS):
+            if age <= limit:
+                out[i]["count"] += 1
+                break
+    return out
+
+
+def _pct(values: list[int], q: float) -> Optional[int]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(len(ordered) * q))
+    return ordered[idx]
+
+
+@router.get("/waiting")
+def waiting(parked_limit: int = Query(400, ge=0, le=2000)):
+    """The owner's inbox, in full: every framed ask, then the other parks."""
+    raw = _int_or_none(parked_limit)
+    limit = 400 if raw is None else raw
+    framed: list[dict[str, Any]] = []
+    parked: list[dict[str, Any]] = []
+    totals = {"framed": 0, "parked": 0, "needs_input": 0}
+    by_board: list[dict[str, Any]] = []
+    for b in _boards():
+        part = _awaiting_for_board(b["slug"], b["path"], limit)
+        framed.extend(part["framed"])
+        parked.extend(part["parked"])
+        totals["framed"] += part["framed_total"]
+        totals["parked"] += part["parked_total"]
+        totals["needs_input"] += part["total"]
+        by_board.append({"slug": b["slug"], "title": b["title"],
+                         "framed": part["framed_total"], "parked": part["parked_total"]})
+    framed.sort(key=lambda i: -(i["age_seconds"] or 0))
+    parked.sort(key=lambda i: (0 if i["human_hint"] else 1, -(i["age_seconds"] or 0)))
+    hints: dict[str, int] = {}
+    for item in framed:
+        for tag in item.get("hints") or []:
+            hints[tag] = hints.get(tag, 0) + 1
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "framed": framed,
+        "parked": parked,
+        "totals": totals,
+        "boards": by_board,
+        "aging": _bucketize([int(i["age_seconds"] or 0) for i in framed]),
+        "parked_aging": _bucketize([int(i["age_seconds"] or 0) for i in parked]),
+        "tags": hints,
+    }
+
+
+@router.get("/insights")
+def insights(hours: int = Query(48, ge=6, le=336)):
+    """Aggregates for the visual page: throughput, what is stuck, who is working, what is failing."""
+    hours = _int_or_none(hours) or 48
+    now = _now()
+    since = now - hours * 3600
+    day = now - 86400
+    boards = _boards()
+
+    status_mix: dict[str, int] = {}
+    blocked_kinds: dict[str, int] = {}
+    per_board: list[dict[str, Any]] = []
+    stuck_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    created: dict[int, int] = {}
+    completed: dict[int, int] = {}
+    blocked_ev: dict[int, int] = {}
+    runs_started = runs_done = 0
+    durations: list[int] = []
+    cycles: list[int] = []
+    running_by_profile: dict[str, int] = {}
+    done_by_profile: dict[str, int] = {}
+
+    for b in boards:
+        with closing(_ro(b["path"])) as conn:
+            counts = {str(r["status"]): int(r["c"]) for r in _q(conn, "SELECT status, COUNT(*) c FROM tasks GROUP BY status")}
+            for key, val in counts.items():
+                status_mix[key] = status_mix.get(key, 0) + val
+            for r in _q(conn, "SELECT block_kind, COUNT(*) c FROM tasks WHERE status IN ('blocked','triage') GROUP BY 1"):
+                key = str(r["block_kind"] or "untyped")
+                blocked_kinds[key] = blocked_kinds.get(key, 0) + int(r["c"])
+            per_board.append({"slug": b["slug"], "title": b["title"], "counts": counts})
+
+            for r in _q(conn, """
+                SELECT t.id, t.title, t.assignee, COALESCE(t.block_kind,'untyped') AS kind,
+                       COALESCE((SELECT MAX(e.created_at) FROM task_events e
+                                  WHERE e.task_id = t.id AND e.kind = 'blocked'), t.created_at) AS since
+                  FROM tasks t WHERE t.status IN ('blocked','triage')
+            """):
+                stuck_rows.append({
+                    "board": b["slug"], "board_title": b["title"], "id": r["id"], "title": r["title"],
+                    "assignee": r["assignee"], "kind": r["kind"],
+                    "age_seconds": now - (_int_or_none(r["since"]) or now),
+                })
+
+            for r in _q(conn, """
+                SELECT id, title, assignee, consecutive_failures, last_failure_error FROM tasks
+                 WHERE consecutive_failures > 0 OR last_failure_error IS NOT NULL
+                 ORDER BY consecutive_failures DESC, id DESC LIMIT 10
+            """):
+                failures.append({
+                    "board": b["slug"], "id": r["id"], "title": r["title"], "assignee": r["assignee"],
+                    "failures": int(r["consecutive_failures"] or 0),
+                    "error": (r["last_failure_error"] or "")[:300] or None,
+                })
+
+            for r in _q(conn, "SELECT (created_at/3600)*3600 b, COUNT(*) c FROM tasks "
+                              "WHERE created_at >= ? GROUP BY 1", (since,)):
+                key = _int_or_none(r["b"])
+                if key is not None:
+                    created[key] = created.get(key, 0) + int(r["c"])
+            for r in _q(conn, "SELECT (completed_at/3600)*3600 b, COUNT(*) c FROM tasks "
+                              "WHERE completed_at >= ? GROUP BY 1", (since,)):
+                key = _int_or_none(r["b"])
+                if key is not None:
+                    completed[key] = completed.get(key, 0) + int(r["c"])
+            for r in _q(conn, "SELECT (created_at/3600)*3600 b, COUNT(*) c FROM task_events "
+                              "WHERE kind='blocked' AND created_at >= ? GROUP BY 1", (since,)):
+                key = _int_or_none(r["b"])
+                if key is not None:
+                    blocked_ev[key] = blocked_ev.get(key, 0) + int(r["c"])
+
+            for r in _q(conn, "SELECT COUNT(*) c FROM task_runs WHERE started_at >= ?", (day,)):
+                runs_started += int(r["c"] or 0)
+            for r in _q(conn, "SELECT COUNT(*) c FROM task_runs WHERE ended_at >= ?", (day,)):
+                runs_done += int(r["c"] or 0)
+            for r in _q(conn, "SELECT started_at, ended_at FROM task_runs "
+                              "WHERE ended_at IS NOT NULL AND started_at IS NOT NULL AND ended_at >= ?", (day,)):
+                a, z = _int_or_none(r["started_at"]), _int_or_none(r["ended_at"])
+                if a and z and z > a:
+                    durations.append(z - a)
+            for r in _q(conn, "SELECT created_at, completed_at FROM tasks "
+                              "WHERE status='done' AND completed_at >= ? AND created_at IS NOT NULL", (day,)):
+                a, z = _int_or_none(r["created_at"]), _int_or_none(r["completed_at"])
+                if a and z and z > a:
+                    cycles.append(z - a)
+            for r in _q(conn, "SELECT assignee, COUNT(*) c FROM tasks WHERE status='running' GROUP BY 1"):
+                running_by_profile[str(r["assignee"] or "unassigned")] = int(r["c"])
+            for r in _q(conn, "SELECT assignee, COUNT(*) c FROM tasks WHERE status='done' AND completed_at >= ? GROUP BY 1", (day,)):
+                done_by_profile[str(r["assignee"] or "unassigned")] = int(r["c"])
+
+    spark: dict[int, int] = {}
+    for b in boards:
+        with closing(_ro(b["path"])) as conn:
+            for r in _q(conn, "SELECT (created_at/600)*600 b, COUNT(*) c FROM task_events "
+                              "WHERE created_at >= ? AND kind != 'heartbeat' GROUP BY 1", (now - 2 * 3600,)):
+                key = _int_or_none(r["b"])
+                if key is not None:
+                    spark[key] = spark.get(key, 0) + int(r["c"])
+
+    # what is parked on the owner — the other half of "what is going on"
+    awaiting = {"framed": 0, "parked": 0, "oldest_seconds": 0}
+    for b in boards:
+        part = _awaiting_for_board(b["slug"], b["path"], 0)
+        awaiting["framed"] += part["framed_total"]
+        awaiting["parked"] += part["parked_total"]
+        if part["framed"]:
+            awaiting["oldest_seconds"] = max(awaiting["oldest_seconds"],
+                                             max(int(i["age_seconds"] or 0) for i in part["framed"]))
+
+    stuck_rows.sort(key=lambda r: -(r["age_seconds"] or 0))
+    sched = _schedules()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": hours,
+        "awaiting": awaiting,
+        "status_mix": status_mix,
+        "blocked_kinds": blocked_kinds,
+        "boards": per_board,
+        "throughput": [
+            {"t": _iso(t), "created": created.get(t, 0), "completed": completed.get(t, 0),
+             "blocked": blocked_ev.get(t, 0)}
+            for t in sorted(set(list(created) + list(completed) + list(blocked_ev)))
+        ],
+        "stuck": {
+            "total": len(stuck_rows),
+            "aging": _bucketize([int(r["age_seconds"] or 0) for r in stuck_rows]),
+            "aging_by_kind": {
+                kind: _bucketize([int(r["age_seconds"] or 0) for r in stuck_rows if r["kind"] == kind])
+                for kind in sorted({r["kind"] for r in stuck_rows})
+            },
+            "oldest": stuck_rows[:12],
+        },
+        "runs": {
+            "started_24h": runs_started,
+            "finished_24h": runs_done,
+            "duration_median_s": _pct(durations, 0.5),
+            "duration_p90_s": _pct(durations, 0.9),
+            "measured": len(durations),
+            "running_by_profile": running_by_profile,
+            "done_24h_by_profile": done_by_profile,
+        },
+        "cycle": {"median_s": _pct(cycles, 0.5), "p90_s": _pct(cycles, 0.9), "measured": len(cycles)},
+        "failures": failures,
+        "spark": [{"t": _iso(t), "count": spark[t]} for t in sorted(spark)],
+        "schedules": {
+            "total": sched["total"],
+            "enabled": sched["enabled"],
+            "paused": sched["total"] - sched["enabled"],
+            "failing": sched["failing"],
+            "upcoming": sched["upcoming"][:10],
+        },
+    }
+
+
 @router.get("/boards")
 def boards():
     """Board list + per-board counts (cheap; used by the board filter)."""
