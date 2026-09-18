@@ -23,6 +23,8 @@ const ID = 'mission-control'
 const WAITING = '/mission-control'
 const INSIGHTS = '/mission-control/insights'
 const ESTATE = '/mission-control/estate'
+const WAITING_ON_ME = '/mission-control/waiting'
+const PROJECTS = '/mission-control/projects'
 
 const CSS = `
 .mc-page{display:flex;flex-direction:column;gap:14px;padding:14px 16px 40px;height:100%;overflow:auto}
@@ -71,6 +73,22 @@ const CSS = `
 .mc-c3{background:color-mix(in srgb,var(--ui-accent) 30%,transparent)}
 .mc-c4{background:color-mix(in srgb,var(--ui-text-quaternary) 70%,transparent)}
 .mc-dot{width:7px;height:7px;border-radius:50%;background:var(--ui-accent);display:inline-block}
+.mc-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.mc-search { background: transparent; border: 1px solid var(--ui-stroke-secondary); border-radius: 5px; padding: 3px 8px; font-size: 11px; color: var(--ui-text-secondary); }
+.mc-card { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.mc-card-h { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.mc-card-t-inline { font-size: 13px; font-weight: 600; color: var(--ui-text-primary); }
+.mc-chips { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.mc-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--ui-text-secondary); border: 1px solid var(--ui-stroke-secondary); border-radius: 999px; padding: 1px 8px; }
+.mc-chip-x { background: transparent; border: 0; color: var(--ui-text-tertiary); cursor: pointer; font-size: 11px; padding: 0 2px; }
+.mc-select { background: transparent; color: var(--ui-text-secondary); font-size: 11px; border: 1px solid var(--ui-stroke-secondary); border-radius: 5px; padding: 2px 6px; }
+.mc-ask-foot { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.mc-note { font-size: 11px; color: var(--ui-text-secondary); }
+.mc-row-click { cursor: pointer; }
+.mc-row-click:hover { background: var(--chrome-action-hover, transparent); }
+.mc-tiles-sm .mc-tile-v, .mc-tiles-sm { font-size: 12px; }
+.mc-mono { font-family: var(--ui-font-mono, ui-monospace, monospace); font-size: 11px; color: var(--ui-text-tertiary); }
+.mc-dim { font-size: 11px; color: var(--ui-text-tertiary); }
 `
 
 // ---------------------------------------------------------------- helpers
@@ -393,18 +411,20 @@ function MissionControlPage() {
       jsx(Tile, { k: 'schedules failing', v: fmtNum((sched.failing || []).length), n: `${sched.enabled || 0} of ${sched.total || 0} enabled`, tone: (sched.failing || []).length ? 'warn' : undefined })
     ] }),
     jsx(SincePanel, {}),
+    jsx(ProjectStrip, {}),
     jsxs('div', { className: 'mc-grid2', children: [
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: '14px' }, children: [
         jsx(Section, {
-          title: 'Waiting on you — answer in place',
-          sub: `${framed.length} shown of ${d.awaiting?.framed_total || 0} framed`,
-          right: jsx('input', {
-            placeholder: 'filter…', value: q, onChange: e => setQ(e.target.value),
-            style: { background: 'transparent', border: '1px solid var(--ui-stroke-secondary)', borderRadius: '5px', padding: '2px 6px', fontSize: '11px', color: 'var(--ui-text-secondary)' }
-          }),
-          children: framed.length
-            ? framed.map(i => jsx(AskRow, { item: i, onDone: refresh }, `${i.board}${i.id}`))
-            : jsx(EmptyState, { title: 'Nothing framed for you right now' })
+          title: 'Waiting on you',
+          sub: `${framed.length} ask${framed.length === 1 ? '' : 's'} with options`,
+          children: [
+            jsx('div', { className: 'mc-row-m', children: 'Your asks have their own page now, so this one stays an overview of everything ELSE that needs action.' }),
+            jsx(Button, {
+              variant: framed.length ? 'primary' : 'ghost', size: 'sm',
+              onClick: () => { haptic('tap'); host.navigate(WAITING_ON_ME) },
+              children: framed.length ? `Answer ${framed.length} waiting ask${framed.length === 1 ? '' : 's'} →` : 'Waiting on Me →'
+            })
+          ]
         }),
         jsx(Section, {
           title: 'In flight',
@@ -848,6 +868,186 @@ function UnownedPanel({ profiles }) {
   })
 }
 
+
+// ---------------------------------------------------------------- Waiting on Me (its own page)
+
+function WaitingOnMePage() {
+  useCss()
+  const w = useRest('/waiting', 45000)
+  const [q, setQ] = useState('')
+  const d = w.data
+  if (w.isError) return jsxs('div', { className: 'mc-page', children: [
+    jsx(ErrorState, { title: 'Waiting on Me is unreachable', hint: 'the backend answered an error — check the dashboard service' }) ] })
+  if (!d) return jsxs('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
+  const t = d.totals || {}
+  const match = x => {
+    if (!q.trim()) return true
+    const s = q.toLowerCase()
+    return `${x.title || ''} ${x.assignee || ''} ${x.id || ''} ${x.ask || ''} ${x.board_title || ''}`.toLowerCase().includes(s)
+  }
+  const framed = (d.framed || []).filter(match)
+  const parked = (d.parked || []).filter(match)
+  return jsxs('div', { className: 'mc-page', children: [
+    jsxs('div', { className: 'mc-head', children: [
+      jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Waiting on Me' }),
+      jsx('div', { className: 'mc-sec-s', children: `only what needs a decision from you · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx('input', {
+        className: 'mc-search', placeholder: 'filter…', value: q, onChange: e => setQ(e.target.value)
+      }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => invalidate(), children: 'refresh' })
+    ] }),
+    jsxs('div', { className: 'mc-tiles', children: [
+      jsx(Tile, { k: 'asks with options', v: fmtNum(t.framed ?? framed.length), n: `oldest ${fmtAge(d.oldest_seconds)}`, tone: (t.framed || framed.length) ? 'warn' : undefined }),
+      jsx(Tile, { k: 'parked, no ask', v: fmtNum(t.parked ?? parked.length), n: 'held by a bot, nothing for you to decide' }),
+      jsx(Tile, { k: 'needs_input total', v: fmtNum(t.needs_input), n: 'includes internal flips' })
+    ] }),
+    framed.length
+      ? jsx(Section, {
+          title: 'Answer in place',
+          sub: `${framed.length} ask${framed.length === 1 ? '' : 's'} with options · pick one, or use the recommendation`,
+          children: framed.map(i => jsx(AskRow, { item: i, onDone: () => invalidate() }, `${i.board}${i.id}`))
+        })
+      : jsx(Section, { title: 'Nothing is waiting on you', children: jsx(EmptyState, { title: 'clear board', hint: 'asks show up here the moment a bot frames options for you' }) }),
+    parked.length
+      ? jsx(Section, {
+          title: 'Parked, nothing to decide',
+          sub: `${parked.length} shown`,
+          children: parked.slice(0, 12).map(i => jsxs('div', { className: 'mc-row', children: [
+            jsx('div', { className: 'mc-row-t', children: i.title }),
+            jsxs('div', { className: 'mc-row-m', children: [
+              jsx(Badge, { children: i.status }),
+              jsx('span', { children: i.board_title || i.board }),
+              jsx('span', { children: i.id }),
+              jsx('span', { children: `parked ${fmtAge(i.age_seconds)}` })
+            ] })
+          ] }, `${i.board}${i.id}`))
+        })
+      : null
+  ] })
+}
+
+// ---------------------------------------------------------------- Projects (the owner-facing layer)
+
+function ProjectStrip() {
+  const p = useRest('/projects', 120000)
+  const rows = ((p.data || {}).projects || []).filter(r => r.status !== 'archived')
+  if (!rows.length) return null
+  return jsx(Section, {
+    title: 'Active projects',
+    sub: `${rows.length} · ${rows.filter(r => r.status === 'active').length} active`,
+    children: [
+      ...rows.map(r => jsxs('div', {
+        className: 'mc-row mc-row-click',
+        onClick: () => { haptic('tap'); host.navigate(PROJECTS) },
+        children: [
+          jsx('div', { className: 'mc-row-t', children: r.name }),
+          jsxs('div', { className: 'mc-row-m', children: [
+            jsx(Badge, { children: r.status }),
+            jsx('span', { children: `${fmtNum(r.open)} open` }),
+            jsx('span', { children: `${fmtNum(r.blocked)} blocked` }),
+            jsx('span', { children: `${fmtNum(r.asks)} waiting on you` }),
+            jsx('span', { children: `${r.bots.length} bots` }),
+            r.failing ? jsx(Badge, { variant: 'outline', children: `${r.failing} failing` }) : null
+          ] })
+        ]
+      }, r.key)),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(PROJECTS), children: 'Manage projects →' })
+    ]
+  })
+}
+
+function ProjectsPage() {
+  useCss()
+  const p = useRest('/projects', 60000)
+  const est = useRest('/estate', 300000)
+  const [busy, setBusy] = useState(null)
+  const [note, setNote] = useState(null)
+  const d = p.data
+  if (p.isError) return jsxs('div', { className: 'mc-page', children: [
+    jsx(ErrorState, { title: 'Projects are unreachable' }) ] })
+  if (!d) return jsxs('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
+  const names = (((est.data || {}).profiles) || []).map(x => x.profile).filter(Boolean).sort()
+
+  async function setStatus(pr, status, pauseBots) {
+    setBusy(pr.key); setNote(null)
+    try {
+      const r = status === 'archived'
+        ? await rest('/projects/archive', { method: 'POST', body: { key: pr.key, archived: true, pause_bots: !!pauseBots } })
+        : await rest('/projects/save', { method: 'POST', body: { key: pr.key, status } })
+      const parked = (r.cron || []).filter(c => c.changed).map(c => `${c.profile}(${c.changed})`).join(' ')
+      setNote(`${pr.name} → ${r.status}${parked ? ` · parked jobs: ${parked}` : ''}`)
+      invalidate()
+    } catch (e) {
+      setNote(`${pr.name}: ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  async function linkBot(pr, bot, add) {
+    const next = add ? (pr.bots_explicit || []).concat([bot]) : (pr.bots_explicit || []).filter(b => b !== bot)
+    setBusy(pr.key); setNote(null)
+    try {
+      await rest('/projects/save', { method: 'POST', body: { key: pr.key, bots: next } })
+      setNote(`${pr.name}: ${add ? 'linked' : 'unlinked'} ${bot}`)
+      invalidate()
+    } catch (e) {
+      setNote(`${pr.name}: ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  return jsxs('div', { className: 'mc-page', children: [
+    jsxs('div', { className: 'mc-head', children: [
+      jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Projects' }),
+      jsx('div', { className: 'mc-sec-s', children: `${d.projects.length} project${d.projects.length === 1 ? '' : 's'} · from projects.db, merged across profiles by slug` }),
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => invalidate(), children: 'refresh' })
+    ] }),
+    ...d.projects.map(pr => jsxs('div', { className: 'mc-card', children: [
+      jsxs('div', { className: 'mc-card-h', children: [
+        jsx(Badge, { children: pr.status }),
+        jsx('span', { className: 'mc-card-t-inline', children: pr.name }),
+        pr.board ? jsx('span', { className: 'mc-mono', children: `board ${pr.board}` }) : null,
+        jsx('span', { className: 'mc-dim', children: `${(pr.homes || []).join(', ')} · ${pr.ids.length} project id(s)` })
+      ] }),
+      jsxs('div', { className: 'mc-tiles mc-tiles-sm', children: [
+        jsx(Tile, { k: 'open', v: fmtNum(pr.open), n: `${fmtNum(pr.cards.running || 0)} running` }),
+        jsx(Tile, { k: 'blocked', v: fmtNum(pr.blocked), tone: pr.blocked ? 'warn' : undefined, n: 'incl. triage' }),
+        jsx(Tile, { k: 'waiting on you', v: fmtNum(pr.asks), tone: pr.asks ? 'warn' : undefined, n: 'asks on this board' }),
+        jsx(Tile, { k: 'bots', v: fmtNum(pr.bots.length), n: pr.failing ? `${pr.failing} with a failing job` : 'no failing jobs' })
+      ] }),
+      pr.description ? jsx('div', { className: 'mc-dim', children: pr.description }) : null,
+      jsxs('div', { className: 'mc-chips', children: [
+        ...pr.bots.map(b => jsxs('span', { className: 'mc-chip', children: [
+          jsx('span', { children: b }),
+          (pr.bots_explicit || []).includes(b)
+            ? jsx('button', { className: 'mc-chip-x', title: 'unlink', onClick: () => void linkBot(pr, b, false), children: '✕' })
+            : null
+        ] }, b)),
+        jsxs('select', {
+          className: 'mc-select', value: '',
+          onChange: e => { if (e.target.value) void linkBot(pr, e.target.value, true) },
+          children: [jsx('option', { value: '', children: 'link a bot…' }, 'none')]
+            .concat(names.map(n => jsx('option', { value: n, children: n }, n)))
+        })
+      ] }),
+      jsxs('div', { className: 'mc-ask-foot', children: [
+        jsx(Button, { size: 'sm', disabled: busy === pr.key || pr.status === 'active', onClick: () => void setStatus(pr, 'active'), children: 'Active' }),
+        jsx(Button, { size: 'sm', disabled: busy === pr.key || pr.status === 'paused', onClick: () => void setStatus(pr, 'paused'), children: 'Pause' }),
+        jsx(Button, { size: 'sm', disabled: busy === pr.key || pr.status === 'archived', onClick: () => void setStatus(pr, 'archived'), children: 'Archive' }),
+        jsx(Button, { size: 'sm', variant: 'ghost', disabled: busy === pr.key, onClick: () => void setStatus(pr, 'archived', true), children: 'Archive + park its bots' }),
+        note ? jsx('span', { className: 'mc-note', children: note }) : null
+      ] })
+    ] }, pr.key)),
+    jsx(Section, {
+      title: 'How this relates to the app’s own Projects',
+      children: jsx('div', { className: 'mc-row-m', children: 'Projects come from projects.db — the same store the app’s Projects screen writes — merged across profiles by slug, because each profile keeps its own copy of the ids. Status, linked bots and notes are Mission Control’s layer (state/mc-projects.json); the bot list is also derived from whoever is actually holding the project’s cards.' })
+    }),
+    d.orphan_project_ids && d.orphan_project_ids.length
+      ? jsx(Section, { title: 'Project ids with no project record', sub: `${d.orphan_project_ids.length}`, children: jsx('div', { className: 'mc-mono', children: d.orphan_project_ids.join(', ') }) })
+      : null
+  ] })
+}
+
 // ---------------------------------------------------------------- the status-bar chip
 
 function WaitingChip() {
@@ -896,7 +1096,11 @@ export default {
         data: { id: 'mission-control.open', label: 'Open Mission Control', category: 'Mission Control', defaults: ['mod+shift+m'], run: () => host.navigate(WAITING) }
       },
       { id: 'estate', area: ROUTES_AREA, data: { path: ESTATE }, render: () => jsx(EstatePage, {}) },
+      { id: 'waiting', area: ROUTES_AREA, data: { path: WAITING_ON_ME }, render: () => jsx(WaitingOnMePage, {}) },
+      { id: 'projects', area: ROUTES_AREA, data: { path: PROJECTS }, render: () => jsx(ProjectsPage, {}) },
       { id: 'nav-estate', area: SIDEBAR_NAV_AREA, data: { path: ESTATE, label: 'Estate', codicon: 'server-process' } },
+      { id: 'nav-waiting', area: SIDEBAR_NAV_AREA, data: { path: WAITING_ON_ME, label: 'Waiting on Me', codicon: 'inbox' } },
+      { id: 'nav-projects', area: SIDEBAR_NAV_AREA, data: { path: PROJECTS, label: 'Projects', codicon: 'briefcase' } },
       {
         id: 'workspace', area: PALETTE_AREA,
         data: {

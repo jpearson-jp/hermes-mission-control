@@ -34,6 +34,8 @@ from pydantic import BaseModel
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
+import subprocess
+import sys
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +74,7 @@ def _hermes_home() -> Path:
     try:
         from hermes_constants import get_hermes_home
 
-        return Path(get_hermes_home())
+        return Path(_hermes_home())
     except Exception:
         return Path.home() / ".hermes"
 
@@ -1364,3 +1366,254 @@ def attention(days: int = Query(7, ge=1, le=90)):
         "oldest_open_s": (now - oldest_open) if oldest_open else None,
         "lanes": ordered,
     }
+
+
+# =====================================================================================
+# PROJECTS — the owner-facing layer over the estate's own project store
+# =====================================================================================
+# MC_PROJECTS_ROUTES
+#
+# `~/.hermes/projects.db` (hermes_cli/projects_db.py) is the estate's REAL project store, and the
+# desktop app already has a Projects surface over it — so this page reads the SAME store rather
+# than inventing a parallel concept. Two measured facts shape the code below:
+#
+#   * projects.db is PER-PROFILE. "The One Stack" exists three times on this box
+#     (p_38dd7b92 root, p_ae993f2c eng-lead, p_eefc522f tos-dreamer) with the same `slug`. Merge by
+#     slug (fallback: primary_path, then id), never by id, or the page reports one project as three.
+#   * Cards carry `tasks.project_id`, which can name an id from the CREATING profile's db — so a
+#     project's cards are found by "any of its ids" OR "its board_slug".
+
+MC_PROJECTS_STATE = Path(_hermes_home()) / "state" / "mc-projects.json"
+
+
+def _mc_projects_state() -> dict:
+    """Mission Control's own management layer: which bots belong to a project, its owner-facing
+    status, and notes. Kept OUT of projects.db on purpose — that store is core-owned and the
+    desktop app writes it; this is the layer the owner edits from here."""
+    try:
+        return json.loads(MC_PROJECTS_STATE.read_text())
+    except Exception:
+        return {"projects": {}}
+
+
+def _mc_projects_save(state: dict) -> None:
+    MC_PROJECTS_STATE.parent.mkdir(parents=True, exist_ok=True)
+    MC_PROJECTS_STATE.write_text(json.dumps(state, indent=1, sort_keys=True))
+
+
+def _project_records() -> list[dict]:
+    """Every project on the box, merged by slug across all projects.db files."""
+    homes = [Path(_hermes_home())] + sorted((Path(_hermes_home()) / "profiles").glob("*/"))
+    merged: dict[str, dict] = {}
+    for home in homes:
+        db = home / "projects.db"
+        if not db.exists():
+            continue
+        try:
+            with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                for r in conn.execute("SELECT * FROM projects"):
+                    key = (r["slug"] or r["id"] or "").strip()
+                    rec = merged.setdefault(key, {
+                        "key": key, "slug": r["slug"], "name": r["name"], "ids": [],
+                        "board": r["board_slug"], "path": r["primary_path"],
+                        "description": r["description"], "archived": bool(r["archived"]),
+                        "homes": [],
+                    })
+                    if r["id"] not in rec["ids"]:
+                        rec["ids"].append(r["id"])
+                    rec["homes"].append("root" if home.name == ".hermes" else home.name)
+                    rec["archived"] = rec["archived"] or bool(r["archived"])
+        except Exception:
+            continue
+    return list(merged.values())
+
+
+def _bot_schedules(profile: str) -> dict:
+    """enabled / failing job counts for one bot, read from its own cron store."""
+    store = Path(_hermes_home()) / "profiles" / profile / "cron" / "jobs.json"
+    if profile == "default":
+        store = Path(_hermes_home()) / "cron" / "jobs.json"
+    try:
+        jobs = json.loads(store.read_text())
+        jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+    except Exception:
+        return {"enabled": 0, "failing": 0, "measured": False}
+    enabled = [j for j in jobs if j.get("enabled", True)]
+    failing = [j for j in enabled if str(j.get("last_status") or "").lower() not in ("ok", "", "none")]
+    return {"enabled": len(enabled), "failing": len(failing), "measured": True,
+            "failing_names": [j.get("name") for j in failing][:4]}
+
+
+@router.get("/projects")
+def projects():
+    """Every active project with its health: cards, asks waiting on the owner, bots, schedules."""
+    state = _mc_projects_state()
+    registry = state.get("projects") or {}
+    now = _now()
+
+    # board -> per-status and per-project_id census
+    by_pid: dict[str, dict] = {}
+    all_assignees: dict[str, dict] = {}
+    board_cards: dict[str, dict] = {}
+    for b in _boards():
+        with closing(_ro(b["path"])) as conn:
+            for r in _q(conn, "SELECT project_id, status, COUNT(*) c FROM tasks GROUP BY 1, 2"):
+                pid = r["project_id"] or ""
+                d = by_pid.setdefault(pid, {})
+                d[r["status"]] = int(r["c"] or 0)
+            for r in _q(conn, "SELECT assignee, COUNT(*) c FROM tasks WHERE status IN "
+                              "('todo','ready','triage','blocked','running') GROUP BY 1"):
+                a = (r["assignee"] or "").strip()
+                if a:
+                    all_assignees[a] = all_assignees.get(a, {})
+                    all_assignees[a][b["slug"]] = all_assignees[a].get(b["slug"], 0) + int(r["c"] or 0)
+            row = {}
+            for r in _q(conn, "SELECT status, COUNT(*) c FROM tasks GROUP BY 1"):
+                row[r["status"]] = int(r["c"] or 0)
+            for r in _q(conn, "SELECT COUNT(*) c FROM tasks WHERE block_kind='needs_input' "
+                              "AND status IN ('blocked','triage')"):
+                row["_asks"] = int(r["c"] or 0)
+            board_cards[b["slug"]] = row
+
+    # asks per project: reuse the framed-ask contract so this agrees with /waiting
+    ask_by_board: dict[str, int] = {}
+    for b in _boards():
+        ask_by_board[b["slug"]] = board_cards.get(b["slug"], {}).get("_asks", 0)
+
+    out = []
+    for rec in _project_records():
+        key = rec["key"]
+        reg = registry.get(key) or registry.get(rec["slug"]) or {}
+        status = (reg.get("status") or ("archived" if rec["archived"] else "active")).lower()
+        cards = dict(by_pid.get("") or {}) and {}
+        totals: dict[str, int] = {}
+        for pid in rec["ids"]:
+            for k, v in (by_pid.get(pid) or {}).items():
+                totals[k] = totals.get(k, 0) + v
+        if rec["board"]:
+            for k, v in (board_cards.get(rec["board"]) or {}).items():
+                if k != "_asks":
+                    totals.setdefault(k, v)
+        bots = list(reg.get("bots") or [])
+        # derived: whoever is actually holding this project's cards
+        for name, boards in all_assignees.items():
+            if rec["board"] and boards.get(rec["board"]) and name not in bots:
+                bots.append(name)
+        sched = {b: _bot_schedules(b) for b in bots}
+        out.append({
+            "key": key, "slug": rec["slug"], "name": rec["name"], "status": status,
+            "board": rec["board"], "path": rec["path"], "description": rec["description"],
+            "ids": rec["ids"], "homes": rec["homes"],
+            "cards": totals,
+            "open": sum(v for k, v in totals.items() if k in ("todo", "ready", "triage", "running")),
+            "blocked": totals.get("blocked", 0) + totals.get("triage", 0),
+            "asks": ask_by_board.get(rec["board"], 0),
+            "bots": sorted(set(bots)),
+            "bots_explicit": list(reg.get("bots") or []),
+            "schedules": sched,
+            "failing": sum(1 for s in sched.values() if s.get("failing")),
+            "notes": reg.get("notes") or "",
+            "updated_at": reg.get("updated_at"),
+        })
+    out.sort(key=lambda p: (-p["asks"], -p["blocked"], p["name"] or ""))
+    orphans = sorted(k for k in by_pid if k and not any(k in rec["ids"] for rec in _project_records()))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "projects": out,
+        "active": [p["key"] for p in out if p["status"] == "active"],
+        "orphan_project_ids": orphans,
+        "note": "projects.db is per-profile; records are merged by slug. Status and bot links are "
+                "Mission Control's own layer, kept in state/mc-projects.json.",
+    }
+
+
+@router.post("/projects/save")
+def projects_save(body: dict):
+    """Set a project's owner-facing status, its bots, or its notes. This is the layer the owner
+    edits here; `projects.db` itself is left to the desktop app's own Projects surface."""
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key required")
+    status = str(body.get("status") or "").lower()
+    if status and status not in ("active", "paused", "archived"):
+        raise HTTPException(status_code=400, detail="status must be active|paused|archived")
+    state = _mc_projects_state()
+    # ⛔ `state.get("projects") or {}` is a WRITE LOSS when the map is empty: an empty dict is
+    # falsy, so setdefault() writes into a throwaway and the save silently persists nothing.
+    # MEASURED 2026-09-17 -- the save returned ok and the file stayed `{"projects": {}}`.
+    entry = state.setdefault("projects", {}).setdefault(key, {})
+    if status:
+        entry["status"] = status
+    bots_in = body.get("bots")
+    if bots_in is not None:
+        entry["bots"] = sorted({str(b).strip() for b in bots_in if str(b).strip()})
+    if body.get("notes") is not None:
+        entry["notes"] = body.get("notes")
+    if body.get("name"):
+        entry["name"] = body.get("name")
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _mc_projects_save(state)
+    return {"ok": True, "key": key, "entry": entry}
+
+
+class ProjectArchiveBody(BaseModel):
+    key: str
+    archived: bool = True
+    pause_bots: bool = False
+
+
+def _cron_set(profile: str, action: str) -> dict:
+    """Pause/resume every enabled job in one bot's store, through the CLI (the scheduler owns the
+    file). `action` is 'pause' or 'resume'."""
+    store = Path(_hermes_home()) / "profiles" / profile / "cron" / "jobs.json"
+    if profile == "default":
+        store = Path(_hermes_home()) / "cron" / "jobs.json"
+    try:
+        jobs = json.loads(store.read_text())
+        jobs = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+    except Exception as exc:                                        # noqa: BLE001
+        return {"profile": profile, "changed": 0, "error": f"unreadable store: {exc}"}
+    exe = str(Path(_hermes_home()) / "hermes-agent" / "venv" / "bin" / "hermes")
+    changed, errors = 0, []
+    for j in jobs:
+        jid = j.get("id")
+        if not jid:
+            continue
+        want = action == "pause"
+        if bool(j.get("enabled", True)) is not want:
+            continue
+        try:
+            p = subprocess.run([exe, "-p", profile, "cron", action, str(jid)],
+                               capture_output=True, text=True, timeout=90)
+            if p.returncode == 0:
+                changed += 1
+            else:
+                errors.append((p.stderr or p.stdout or "").strip()[:80])
+        except Exception as exc:                                    # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return {"profile": profile, "changed": changed, "errors": errors[:3]}
+
+
+@router.post("/projects/archive")
+def projects_archive(body: ProjectArchiveBody):
+    """Archive a project (or bring it back). Optionally park its bots: pause every one of their
+    scheduled jobs — reversible with the same call (`archived=false, pause_bots=true` resumes)."""
+    key = str(body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="key required")
+    state = _mc_projects_state()
+    # ⛔ `state.get("projects") or {}` is a WRITE LOSS when the map is empty: an empty dict is
+    # falsy, so setdefault() writes into a throwaway and the save silently persists nothing.
+    # MEASURED 2026-09-17 -- the save returned ok and the file stayed `{"projects": {}}`.
+    entry = state.setdefault("projects", {}).setdefault(key, {})
+    archived = bool(body.get("archived", True))
+    entry["status"] = "archived" if archived else "active"
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _mc_projects_save(state)
+    bots = entry.get("bots") or []
+    moved = []
+    if body.get("pause_bots") and bots:
+        for b in bots:
+            moved.append(_cron_set(b, "pause" if archived else "resume"))
+    return {"ok": True, "key": key, "status": entry["status"], "bots": bots, "cron": moved}
