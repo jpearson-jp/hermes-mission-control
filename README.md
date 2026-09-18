@@ -32,9 +32,12 @@ and it neither appears nor disappears when you switch the active profile.
 
 ```bash
 mkdir -p ~/.hermes/desktop-plugins/mission-control
-curl -fsSL <your-hermes-url>/dashboard-plugins/mission-control/dist/desktop-plugin.js \
+curl -fsSL https://raw.githubusercontent.com/jpearson-jp/hermes-mission-control/main/desktop/plugin.js \
   -o ~/.hermes/desktop-plugins/mission-control/plugin.js
 ```
+
+Prefer the repo raw URL: `<your-hermes-url>/dashboard-plugins/...` is served by the dashboard and
+now answers 302 to anything without the app's own session, so it is not a scriptable download.
 
 `desktop/dist/` in this repo always holds the current copy, so the download can come from the repo
 raw URL just as well as from a running dashboard.
