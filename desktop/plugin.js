@@ -122,6 +122,19 @@ function quiet(fn) {
   try { fn() } catch { /* plugin actions must never take the app down */ }
 }
 
+// Relative age of a WIRE timestamp. The plugin's own REST payloads carry ISO-8601 STRINGS —
+// `generated_at` from plugin_api.py's datetime.isoformat(), `next_run_at` straight out of
+// jobs.json, `since` from _iso() — while the SDK's relativeTime() takes epoch MILLISECONDS and
+// throws `RangeError: Value need to be finite number for
+// Intl.RelativeTimeFormat.prototype.format()` on anything non-finite. That throw reached the
+// app's error boundary and blanked the whole page on every load. (The web half of this plugin
+// formats the same strings with hhmm(); this is the desktop half's equivalent.)
+function ago(value) {
+  if (value == null || value === '') return '—'
+  const ms = typeof value === 'number' ? value : Date.parse(value)
+  return Number.isFinite(ms) ? relativeTime(ms) : '—'
+}
+
 function fmtAge(seconds) {
   if (seconds == null) return '—'
   if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))}m`
@@ -397,7 +410,7 @@ function MissionControlPage() {
   return jsxs('div', { className: 'mc-page', children: [
     jsxs('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, children: [
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Mission Control' }),
-      jsx('div', { className: 'mc-sec-s', children: `estate-wide · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { className: 'mc-sec-s', children: `estate-wide · updated ${ago(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(INSIGHTS), children: 'Insights →' }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(ESTATE), children: 'Estate →' }),
@@ -465,7 +478,7 @@ function MissionControlPage() {
           jsxs('div', { className: 'mc-row-m', children: [
             jsx('span', { children: j.profile }),
             jsx('span', { children: j.schedule || '' }),
-            jsx('span', { children: j.next_run_at ? relativeTime(j.next_run_at) : '' })
+            jsx('span', { children: j.next_run_at ? ago(j.next_run_at) : '' })
           ] })
         ] }, `${j.profile}${j.id}`)) })
       ] })
@@ -507,7 +520,7 @@ function InsightsPage() {
   return jsxs('div', { className: 'mc-page', children: [
     jsxs('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' }, children: [
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Insights' }),
-      jsx('div', { className: 'mc-sec-s', children: `window ${d.window_hours}h · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { className: 'mc-sec-s', children: `window ${d.window_hours}h · updated ${ago(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(WAITING), children: '← Mission Control' }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => queryClient.invalidateQueries({ queryKey: [ID] }), children: 'refresh' })
@@ -560,7 +573,7 @@ function InsightsPage() {
           ] }, `${j.profile}${j.id}`)) : jsx(EmptyState, { title: 'every schedule is healthy' }),
           jsx(Separator, {}),
           (sched.upcoming || []).slice(0, 6).map(j => jsxs('div', { className: 'mc-row-m', children: [
-            jsx('span', { children: j.next_run_at ? relativeTime(j.next_run_at) : '—' }),
+            jsx('span', { children: j.next_run_at ? ago(j.next_run_at) : '—' }),
             jsx('span', { children: j.name || j.id }),
             jsx('span', { children: j.profile })
           ] }, `${j.profile}${j.id}`))
@@ -613,7 +626,7 @@ function SincePanel() {
   const parked = (delta.parked || []).slice(0, 6)
   return jsx(Section, {
     title: 'Since you last looked',
-    sub: delta.since ? `since ${relativeTime(delta.since)}` : undefined,
+    sub: delta.since ? `since ${ago(delta.since)}` : undefined,
     children: [
       jsxs('div', { className: 'mc-row-m', children: [
         jsx('span', { children: `${c.parked} newly parked on you` }),
@@ -674,7 +687,7 @@ function EstatePage() {
       p.jobs ? jsx('span', { children: `${p.jobs_enabled}/${p.jobs} jobs` }) : null,
       p.jobs_failing ? jsx(Badge, { variant: 'outline', children: `${p.jobs_failing} failing` }) : null,
       p.last_status ? jsx('span', { children: `last: ${p.last_status}` }) : null,
-      p.next_run_at ? jsx('span', { children: `next ${relativeTime(p.next_run_at)}` }) : null
+      p.next_run_at ? jsx('span', { children: `next ${ago(p.next_run_at)}` }) : null
     ] }),
     p.purpose ? jsx('div', { className: 'mc-ask', children: p.purpose.slice(0, 260) }) : null,
     jsxs('div', { className: 'mc-row-m', children: [
@@ -690,7 +703,7 @@ function EstatePage() {
   return jsxs('div', { className: 'mc-page', children: [
     jsxs('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }, children: [
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Estate' }),
-      jsx('div', { className: 'mc-sec-s', children: `every bot · window ${d.window_hours}h · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { className: 'mc-sec-s', children: `every bot · window ${d.window_hours}h · updated ${ago(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => host.navigate(WAITING), children: '← Mission Control' }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: invalidate, children: 'refresh' })
@@ -890,7 +903,7 @@ function WaitingOnMePage() {
   return jsxs('div', { className: 'mc-page', children: [
     jsxs('div', { className: 'mc-head', children: [
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Waiting on Me' }),
-      jsx('div', { className: 'mc-sec-s', children: `only what needs a decision from you · updated ${relativeTime(d.generated_at)}` }),
+      jsx('div', { className: 'mc-sec-s', children: `only what needs a decision from you · updated ${ago(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx('input', {
         className: 'mc-search', placeholder: 'filter…', value: q, onChange: e => setQ(e.target.value)
