@@ -46,6 +46,11 @@ _REC_RE = re.compile(r"\*\*RECOMMENDATION:\s*(\d+)\*\*")
 _OPT_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
 _HUMAN_HINT_RE = re.compile(r"\bjesse\b|\bowner\b|\byour call\b|\bneeds your\b", re.I)
 
+# The ask-queue exclusion module (kanban t_3d6ec309), resolved lazily by `_ask_filter()`:
+# the imported module, or False once we have looked and failed. Never a bare None check --
+# False means "looked and could not", which must not be re-attempted per request.
+_ASK_FILTER = None
+
 OPTION_PREVIEW_CHARS = 260
 ASK_PREVIEW_CHARS = 700
 
@@ -375,6 +380,120 @@ def _briefing(board: str, board_title: str, task_id: str, title: str, status: st
     return "\n".join(lines)
 
 
+def _ask_filter():
+    """The ask queue's THREE exclusions, imported from the scripts store by IDENTITY.
+
+    ⛔ ONE IMPLEMENTATION, FOUR CONSUMERS. `hermes-decision-nag.py`,
+    `decision-framer-facts.py` and `hermes-decision-brief.py` all import
+    `<hermes home>/scripts/lib/owner_ask_filter.py` (kanban t_3d6ec309); this page reads
+    the SAME file rather than a fifth copy of the predicates. Before this, the module's
+    docstring here claimed the dashboard and the nag "never disagree about what is a real
+    owner ask" — and they did: this page had no publication exclusion at all, so the
+    approved-awaiting-publication parks and any card the owner had ALREADY ANSWERED were
+    still presented to him as decisions (measured 2026-09-18: `t_4870fc5f` was answered
+    through this very page at 11:34Z and still listed).
+
+    Returns None when the module cannot be imported — and then NOTHING is excluded, which
+    is the safe direction (the page shows more than it should, never less): a page that
+    silently hid a real ask would be the worse failure. The warning is logged once.
+    """
+    global _ASK_FILTER
+    if _ASK_FILTER is None:
+        for lib_dir in _scripts_lib_dirs():
+            try:
+                if str(lib_dir) not in sys.path:
+                    sys.path.insert(0, str(lib_dir))
+                import owner_ask_filter  # noqa: PLC0415
+                _ASK_FILTER = owner_ask_filter
+                log.info("owner ask-queue exclusions loaded from %s", lib_dir)
+                break
+            except Exception:
+                continue
+        if _ASK_FILTER is None:
+            log.warning("owner_ask_filter could not be imported; 'Waiting on Me' will show "
+                        "answered / publication-parked / duplicate cards (no exclusion)")
+            _ASK_FILTER = False
+    return _ASK_FILTER or None
+
+
+def _scripts_lib_dirs() -> list[Path]:
+    """Where `lib/owner_ask_filter.py` can live, machine-level home first.
+
+    The dashboard can run with a PROFILE home (`--profile <p> serve`): a machine-level
+    plugin would otherwise look for `<profile home>/scripts/lib`, which holds that
+    profile's cron scripts and no `lib/`. Same normalisation the plugin already needs
+    elsewhere: strip a trailing `/profiles/<p>`.
+    """
+    out: list[Path] = []
+
+    def add(base: Path):
+        p = base / "scripts" / "lib"
+        if p not in out:
+            out.append(p)
+
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        home = Path(env)
+        parts = home.parts
+        if "profiles" in parts:
+            home = Path(*parts[:parts.index("profiles")]) or home
+        add(home)
+    add(Path.home() / ".hermes")
+    add(_hermes_home())
+    return out
+
+
+def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """Newest PARK-EVENT payload per task, over the SAME three kinds the scripts read.
+
+    A `block_retyped`/`block_loop_detected` event carries the caller's `reason` byte for
+    byte (that is what a re-type in place and the unblock-loop breaker append), so a
+    reader keyed on `blocked` alone reads a SUPERSEDED park — the same triple
+    `owner_ask_filter.park_sql` builds for the scripts.
+    """
+    out: dict[str, str] = {}
+    kinds = ",".join("'%s'" % k for k in ("blocked", "block_retyped", "block_loop_detected"))
+    for chunk in _chunks(ids):
+        marks = ",".join("?" * len(chunk))
+        latest = {r["task_id"]: r["mid"] for r in conn.execute(
+            f"SELECT task_id, MAX(id) AS mid FROM task_events "
+            f"WHERE kind IN ({kinds}) AND task_id IN ({marks}) GROUP BY task_id", chunk)}
+        if not latest:
+            continue
+        ev = ",".join("?" * len(latest))
+        by_id = {r["id"]: r["task_id"] for r in conn.execute(
+            f"SELECT id, task_id FROM task_events WHERE id IN ({ev})", list(latest.values()))}
+        for row in conn.execute(f"SELECT id, payload FROM task_events WHERE id IN ({ev})",
+                                list(latest.values())):
+            tid = by_id.get(row["id"])
+            if tid:
+                out[tid] = row["payload"]
+    return out
+
+
+def _comments_by_task(conn: sqlite3.Connection, ids: list[str],
+                      per_task: int = 25) -> dict[str, list[tuple[str, str]]]:
+    """The newest `per_task` comments per task, newest first — what the predicates read.
+
+    Bounded on purpose. `hermes-decision-nag` reads 40 and this reads 25, and the
+    asymmetry is in the SAFE direction only: a ruling recorded 30 comments deep is still
+    caught by the nag (which then declines to ask) while this page may still list it —
+    a page that shows one card too many, never one too few. Bodies are capped at 4 000
+    chars for the same reason (a busy card's newest comment is routinely 40 KB).
+    """
+    out: dict[str, list[tuple[str, str]]] = {}
+    for chunk in _chunks(ids):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+                f"SELECT task_id, COALESCE(author,'') AS author, "
+                f"substr(COALESCE(body,''),1,4000) AS body FROM task_comments "
+                f"WHERE task_id IN ({marks}) ORDER BY id DESC", chunk):
+            lst = out.setdefault(row["task_id"], [])
+            if len(lst) < per_task:
+                lst.append((row["author"], row["body"]))
+    return out
+
+
 def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
     """Every owner-facing park on this board, split into framed asks and un-framed parks.
 
@@ -383,12 +502,56 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
     """
     with closing(_ro(db)) as conn:
         rows = _q(conn, _AWAITING_SQL)
-        framed_bodies = _frame_bodies(conn, [r["id"] for r in rows])
+        all_ids = [r["id"] for r in rows]
+        framed_bodies = _frame_bodies(conn, all_ids)
+        payloads = _park_payloads(conn, all_ids)
+        comments = _comments_by_task(conn, all_ids)
+
+        # ⛔ THE ASK QUEUE'S THREE EXCLUSIONS, APPLIED HERE TOO (kanban t_3d6ec309).
+        # This page is the surface the owner actually opens, and it was the LAST reader
+        # without them: it showed every `needs_input` park whose card carried an OPTIONS
+        # block, including cards he had already answered (through this very page) and
+        # approved work whose only remaining act is a publication the release authority
+        # owns. Same predicates as the nag, the framer and the brief -- imported, not
+        # re-spelled. See `_ask_filter`.
+        excluded: dict[str, str] = {}
+        lib = _ask_filter()
+        if lib is not None:
+            for r in rows:
+                if lib.publication_park(payloads.get(r["id"])):
+                    excluded[r["id"]] = "publication-only"
+                    continue
+                if lib.ruling_evidence(comments.get(r["id"]) or ()):
+                    excluded[r["id"]] = "already answered"
+            # (3) DUPLICATE, over the survivors of THIS board: a twin is dropped only when
+            # its carrier is still in this same list, so the question is shown once.
+            linked = [{
+                "key": "%s/%s" % (slug, r["id"]), "board": slug, "id": r["id"],
+                "title": r["title"], "priority": r["priority"], "started_at": r["created_at"],
+                "framed": r["id"] in framed_bodies,
+                "declared": set(lib.declared_carriers(comments.get(r["id"]) or ())),
+            } for r in rows if r["id"] not in excluded]
+            folded = lib.dedupe(linked, {slug: [row["t"] or "" for row in _q(
+                conn, "SELECT COALESCE(title,'') t FROM tasks")]})
+            for key, carrier in folded.items():
+                excluded[key.split("/", 1)[1]] = "duplicate of %s" % carrier
+            rows = [r for r in rows if r["id"] not in excluded]
+
         by_id = {r["id"]: r for r in rows}
         framed_ids = [r["id"] for r in rows if r["id"] in framed_bodies]
         # preview budget: every framed ask (they are the point), then the newest un-framed parks
         preview_ids = framed_ids + [r["id"] for r in rows if r["id"] not in framed_bodies][:limit]
         reasons = _ask_reasons(conn, preview_ids)
+        # named, never silently dropped: what this page declined to show, and why
+        tally: dict[str, int] = {}
+        for _tid, why in excluded.items():
+            tally[why.split(" of ")[0]] = tally.get(why.split(" of ")[0], 0) + 1
+        not_shown = {
+            "count": len(excluded),
+            "by_reason": tally,
+            "named": sorted("%s/%s %s" % (slug, tid, why)
+                            for tid, why in excluded.items())[:25],
+        }
 
     def item(task_id: str) -> dict[str, Any]:
         r = by_id[task_id]
@@ -429,7 +592,11 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         "framed_total": len(framed),
         "parked": parked,
         "parked_total": len(rows) - len(framed),
-        "total": len(rows),
+        # `total` is the board's REAL needs_input park count (what the board holds), so a
+        # reader that wants "how many owner-facing parks exist" is not silently handed the
+        # post-exclusion number; `excluded` names the difference.
+        "total": len(rows) + len(excluded),
+        "excluded": not_shown,
     }
 
 
@@ -758,7 +925,9 @@ def waiting(parked_limit: int = Query(400, ge=0, le=2000)):
     limit = 400 if raw is None else raw
     framed: list[dict[str, Any]] = []
     parked: list[dict[str, Any]] = []
-    totals = {"framed": 0, "parked": 0, "needs_input": 0}
+    totals = {"framed": 0, "parked": 0, "needs_input": 0, "excluded": 0}
+    not_shown: list[str] = []
+    excluded_by_reason: dict[str, int] = {}
     by_board: list[dict[str, Any]] = []
     for b in _boards():
         part = _awaiting_for_board(b["slug"], b["path"], limit)
@@ -767,8 +936,14 @@ def waiting(parked_limit: int = Query(400, ge=0, le=2000)):
         totals["framed"] += part["framed_total"]
         totals["parked"] += part["parked_total"]
         totals["needs_input"] += part["total"]
+        exc = part.get("excluded") or {}
+        totals["excluded"] += int(exc.get("count") or 0)
+        not_shown.extend(exc.get("named") or [])
+        for reason, n in (exc.get("by_reason") or {}).items():
+            excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + int(n)
         by_board.append({"slug": b["slug"], "title": b["title"],
-                         "framed": part["framed_total"], "parked": part["parked_total"]})
+                         "framed": part["framed_total"], "parked": part["parked_total"],
+                         "excluded": int(exc.get("count") or 0)})
     framed.sort(key=lambda i: -(i["age_seconds"] or 0))
     parked.sort(key=lambda i: (0 if i["human_hint"] else 1, -(i["age_seconds"] or 0)))
     hints: dict[str, int] = {}
@@ -784,6 +959,14 @@ def waiting(parked_limit: int = Query(400, ge=0, le=2000)):
         "aging": _bucketize([int(i["age_seconds"] or 0) for i in framed]),
         "parked_aging": _bucketize([int(i["age_seconds"] or 0) for i in parked]),
         "tags": hints,
+        # ⛔ WHAT THIS PAGE DID NOT SHOW, AND WHY. An ask removed from the owner's inbox
+        # and recorded nowhere is the failure mode this estate keeps paying for ("detection
+        # works; delivery does not"), so the exclusions are part of the payload: the count,
+        # the reason tally, and the named cards (kanban t_3d6ec309). Same three classes the
+        # nag and the brief apply: already answered, publication-only, duplicate of a
+        # carrier that IS shown.
+        "excluded": {"count": totals["excluded"], "by_reason": excluded_by_reason,
+                     "named": sorted(not_shown)},
     }
 
 
