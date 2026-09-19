@@ -324,22 +324,34 @@ def _frame_bodies(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
     return out
 
 
-def _ask_reasons(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
-    """Newest ``blocked`` event reason per task (what the decision-nag quotes as THE ASK)."""
+def _ask_reasons(conn: sqlite3.Connection, ids: list[str],
+                 payloads: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """The ASK text per task: the reason on the card's NEWEST PARK EVENT (kanban t_68504b12).
+
+    ⛔ NOT ``kind='blocked'`` ALONE. A park's reason is the newest of ``blocked``,
+    ``block_retyped`` and ``block_loop_detected`` — the same triple
+    ``owner_ask_filter.park_sql`` and ``hermes-decision-nag.BLOCKED_REASON_SQL`` read, and
+    the one `engineering-discipline` §44 states. Reading ``blocked`` alone returns a
+    SUPERSEDED park and fails SILENTLY: it did, on 2026-09-19, when an ``eng-worker`` test
+    park was followed 9 s later by a ``block_loop_detected`` carrying the real reason and
+    this page showed the owner the literal test string "short kinded reason" as THE ASK on
+    `t_72e36f3f` — a live production-secret decision.
+
+    It reads through ``_park_payloads`` — the reader ``_awaiting_for_board`` already uses to
+    decide WHETHER to show a card — so the page cannot decide from one read and render from
+    another, and there is exactly ONE kind list in this file. `payloads` may be passed in
+    when the caller has already read them, so the two consumers share one query.
+
+    A task whose newest park carries no readable reason is ABSENT from the result (the page
+    renders "(none recorded)") rather than falling back to a superseded older text.
+    """
+    if payloads is None:
+        payloads = _park_payloads(conn, ids)
     out: dict[str, str] = {}
-    for chunk in _chunks(ids):
-        marks = ",".join("?" * len(chunk))
-        latest = {r["task_id"]: r["mid"] for r in conn.execute(
-            f"SELECT task_id, MAX(id) mid FROM task_events "
-            f"WHERE kind='blocked' AND task_id IN ({marks}) GROUP BY task_id", chunk)}
-        if not latest:
-            continue
-        ev_marks = ",".join("?" * len(latest))
-        for row in conn.execute(
-                f"SELECT id, task_id, payload FROM task_events WHERE id IN ({ev_marks})", list(latest.values())):
-            reason = _reason_from_payload(row["payload"])
-            if reason:
-                out[row["task_id"]] = reason
+    for tid in ids:
+        reason = _reason_from_payload(payloads.get(tid))
+        if reason:
+            out[tid] = reason
     return out
 
 
@@ -367,7 +379,8 @@ def _briefing(board: str, board_title: str, task_id: str, title: str, status: st
             lines.append(f"  {i}. {opt}{mark}")
     lines += [
         "",
-        "THE ASK (verbatim — the newest park reason on the card):",
+        "THE ASK (verbatim — the reason on the card's NEWEST park event: blocked, "
+        "block_retyped or block_loop_detected):",
         (ask or "(no park reason recorded)"),
         "",
         "My question: explain in plain language what this card is actually about, which project or "
@@ -444,16 +457,38 @@ def _scripts_lib_dirs() -> list[Path]:
     return out
 
 
+_PARK_KINDS_FALLBACK = ("blocked", "block_retyped", "block_loop_detected")
+
+
+def _park_kinds() -> tuple:
+    """The park-event kinds, taken from the scripts store when it is importable.
+
+    ⛔ ONE DEFINITION, MANY READERS. `owner_ask_filter.PARK_EVENT_KINDS` is what
+    `hermes-decision-nag`, `decision-framer-facts`, `hermes-decision-brief` and
+    `pr-promote-sweep` read. This page reads the SAME constant rather than a copy of the
+    literal, so a park kind added to the queue cannot reach the queue and miss this page.
+    The fallback is that same triple, so an unimportable module degrades to today's read
+    and never to an empty one.
+    """
+    lib = _ask_filter()
+    kinds = getattr(lib, "PARK_EVENT_KINDS", None) if lib is not None else None
+    return tuple(kinds) if kinds else _PARK_KINDS_FALLBACK
+
+
 def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
-    """Newest PARK-EVENT payload per task, over the SAME three kinds the scripts read.
+    """Newest PARK-EVENT payload per task, over the SAME kinds the scripts read.
 
     A `block_retyped`/`block_loop_detected` event carries the caller's `reason` byte for
     byte (that is what a re-type in place and the unblock-loop breaker append), so a
     reader keyed on `blocked` alone reads a SUPERSEDED park — the same triple
-    `owner_ask_filter.park_sql` builds for the scripts.
+    `owner_ask_filter.park_sql` builds for the scripts, imported via `_park_kinds()`.
+
+    ⛔ This is the ONE park read in this file, and BOTH consumers share it: the exclusion
+    predicates below (WHETHER to show a card) and `_ask_reasons` (WHAT to render as the
+    ask). They read the same payload for the same task by construction.
     """
     out: dict[str, str] = {}
-    kinds = ",".join("'%s'" % k for k in ("blocked", "block_retyped", "block_loop_detected"))
+    kinds = ",".join("'%s'" % k for k in _park_kinds())
     for chunk in _chunks(ids):
         marks = ",".join("?" * len(chunk))
         latest = {r["task_id"]: r["mid"] for r in conn.execute(
@@ -542,7 +577,7 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         framed_ids = [r["id"] for r in rows if r["id"] in framed_bodies]
         # preview budget: every framed ask (they are the point), then the newest un-framed parks
         preview_ids = framed_ids + [r["id"] for r in rows if r["id"] not in framed_bodies][:limit]
-        reasons = _ask_reasons(conn, preview_ids)
+        reasons = _ask_reasons(conn, preview_ids, payloads=payloads)
         # named, never silently dropped: what this page declined to show, and why
         tally: dict[str, int] = {}
         for _tid, why in excluded.items():

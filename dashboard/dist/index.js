@@ -308,7 +308,7 @@
         h("pre", { className: "mc-brief-pre" }, d.briefing || "")),
       d.frame && d.frame.summary ? h("div", { className: "mc-sum" }, d.frame.summary) : null,
       h("div", { className: "mc-body" }, t.body || "(no body)"),
-      h("div", { className: "mc-muted" }, "ask (newest park reason)"),
+      h("div", { className: "mc-muted" }, "ask (newest park event's reason)"),
       h("div", { className: "mc-ask" }, d.ask || "(none recorded)"),
       h("div", { className: "mc-muted" }, "runs: " + d.runs.length + " · comments: " + d.comments.length),
       h("div", { className: "mc-cards" }, d.comments.slice(0, 8).map(function (c) {
