@@ -328,6 +328,194 @@
 /* ---- page: overview ---- */
 /* Mission Control — the hub page: what is running, what is waiting, what shipped, what is due. */
 
+/* --- Project flow: the value-stream funnel, on the hub page ---
+   Same shape as the desktop half's Flow page and the same /flow payload: band thickness is how
+   many cards are in that stage right now, the outlined band is the constraint, and every stage
+   says whether it is flowing, slowing, backed up, idle, or a queue whose exit is not
+   instrumented. Stage ids and labels come from the payload, so the backend owns the model. */
+
+  function flowVerdict(s) {
+    if (!s.wip) return { tone: "dim", label: "idle — no load" };
+    if (s.flow === "n/a") return { tone: "ok", label: "count" };
+    if (s.constraint) return { tone: "hot", label: "CONSTRAINT" };
+    if (s.flow === "unmeasured") return { tone: "warn", label: "queue · exit not instrumented" };
+    if (s.wait_h == null) return { tone: "warn", label: "no measured exit" };
+    if (s.wait_h <= 2) return { tone: "ok", label: "flowing" };
+    if (s.wait_h <= 12) return { tone: "warn", label: "slowing" };
+    return { tone: "hot", label: "backed up" };
+  }
+
+  function flowStageLine(s) {
+    var bits = [];
+    if (s.wip) bits.push(num(s.wip) + " here");
+    if (s.median_age_h != null) bits.push("median " + s.median_age_h + "h");
+    if (s.oldest_age_h != null && s.oldest_age_h !== s.median_age_h) bits.push("oldest " + s.oldest_age_h + "h");
+    if (s.flow === "unmeasured") bits.push("flow not instrumented");
+    else if (s.flow !== "n/a") bits.push(num(s.out) + " out / " + (s.window_hours || 168) + "h");
+    if (s.wait_h != null && s.wip) bits.push("~" + num(s.wait_h) + "h to clear");
+    return bits.join(" · ");
+  }
+
+  /* The pipe: bands sized by WIP, trapezoid links between them, rework arcs underneath. */
+  function FlowPipe(props) {
+    var rows = (props.stages || []).filter(function (s) { return !s.terminal; });
+    if (!rows.length) return h("div", { className: "mc-muted" }, "nothing in the flow");
+    var W = 1000, H = props.height || 190, cy = H * 0.4;
+    var maxWip = Math.max.apply(null, [1].concat(rows.map(function (s) { return s.wip || 0; })));
+    var bh = function (v) { return v ? Math.max(3, (v / maxWip) * (H * 0.28)) : 1.5; };
+    var slot = W / rows.length;
+    var pad = Math.min(20, slot * 0.18);
+    var left = function (i) { return i * slot + pad; };
+    var right = function (i) { return (i + 1) * slot - pad; };
+    var centre = function (i) { return (left(i) + right(i)) / 2; };
+    var index = {};
+    rows.forEach(function (s, i) { index[s.id] = i; });
+
+    var kids = [];
+    for (var i = 0; i < rows.length - 1; i++) {
+      var a = bh(rows[i].wip), b = bh(rows[i + 1].wip);
+      kids.push(h("polygon", {
+        key: "link-" + i,
+        className: "mc-flow-link",
+        "data-idle": (!rows[i].wip && !rows[i + 1].wip) ? "true" : undefined,
+        points: [right(i).toFixed(1) + "," + (cy - a / 2).toFixed(1),
+                 left(i + 1).toFixed(1) + "," + (cy - b / 2).toFixed(1),
+                 left(i + 1).toFixed(1) + "," + (cy + b / 2).toFixed(1),
+                 right(i).toFixed(1) + "," + (cy + a / 2).toFixed(1)].join(" ")
+      }));
+    }
+    rows.forEach(function (s, i) {
+      var hh = bh(s.wip);
+      kids.push(h("rect", {
+        key: "band-" + s.id,
+        className: "mc-flow-band mc-flow-band-" + flowVerdict(s).tone,
+        "data-hot": s.constraint ? "true" : undefined,
+        x: left(i).toFixed(1), y: (cy - hh / 2).toFixed(1),
+        width: Math.max(2, right(i) - left(i)).toFixed(1), height: hh.toFixed(1), rx: 3
+      }));
+    });
+    rows.forEach(function (s, i) {
+      kids.push(h("text", {
+        key: "num-" + s.id, className: "mc-flow-num", textAnchor: "middle",
+        x: centre(i).toFixed(1), y: (cy - H * 0.3).toFixed(1)
+      }, num(s.wip)));
+      kids.push(h("text", {
+        key: "lbl-" + s.id, className: "mc-flow-lbl", textAnchor: "middle",
+        x: centre(i).toFixed(1), y: (H * 0.84).toFixed(1)
+      }, s.label));
+    });
+    (props.edges || [])
+      .filter(function (e) { return e.direction === "rework" && index[e.from] != null && index[e.to] != null; })
+      .sort(function (a, b) { return b.count - a.count; })
+      .slice(0, 2)
+      .forEach(function (e, k) {
+        var a = index[e.from], b = index[e.to], y = H * (0.62 + k * 0.08);
+        kids.push(h("path", {
+          key: "rw-" + e.from + "-" + e.to, className: "mc-flow-rework",
+          d: "M " + centre(a).toFixed(1) + "," + (cy + bh(rows[a].wip) / 2).toFixed(1) +
+             " C " + centre(a).toFixed(1) + "," + y.toFixed(1) + " " +
+             centre(b).toFixed(1) + "," + y.toFixed(1) + " " +
+             centre(b).toFixed(1) + "," + (cy + bh(rows[b].wip) / 2).toFixed(1)
+        }));
+      });
+
+    return h("svg", {
+      className: "mc-flow-svg", viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none",
+      role: "img", "aria-label": props.label || "value stream"
+    }, kids);
+  }
+
+  function FlowStageGrid(props) {
+    var rows = (props.stages || []).filter(function (s) { return !s.terminal; });
+    return h("div", { className: "mc-flow-stages" }, rows.map(function (s) {
+      var v = flowVerdict(s);
+      return h("div", { key: s.id, className: "mc-flow-stage", "data-tone": v.tone },
+        h("div", { className: "mc-flow-stage-h" },
+          h("span", { className: "mc-flow-stage-t" }, s.label),
+          h(Pill, { kind: v.tone === "hot" ? "mc-pill-warn" : "" }, v.label)),
+        h("div", { className: "mc-flow-stage-v" }, num(s.wip)),
+        h("div", { className: "mc-flow-stage-m" }, flowStageLine(s)));
+    }));
+  }
+
+  function pipelineStagesWeb(pl) {
+    if (!pl || !pl.measured) return [];
+    var b = pl.pr_buckets || {}, dp = pl.deploy || {};
+    var mk = function (id, label, wip) { return { id: id, label: label, wip: wip || 0, terminal: false, flow: "n/a" }; };
+    return [mk("pr_open", "PRs open", pl.prs_open), mk("ci_run", "CI running", b.ci_running),
+      mk("ci_fail", "CI failing", b.ci_failing), mk("conflict", "Conflicts", b.conflicts),
+      mk("review", "Awaiting review", b.awaiting_review), mk("mergeable", "Ready to merge", b.mergeable),
+      mk("merged", "Merged 7d", pl.prs_merged_7d), mk("deploy", "Deploys running", dp.in_progress)];
+  }
+
+  function ProjectFlowBlock(props) {
+    var p = props.project;
+    var stages = p.stages || [];
+    var c = stages.find(function (s) { return s.constraint; });
+    var pl = p.pipeline || {};
+    return h("div", { className: "mc-flow-proj" },
+      h("div", { className: "mc-flow-proj-h" },
+        h("strong", null, p.name),
+        h(Pill, null, "board " + p.board),
+        p.repo ? h("span", { className: "mc-muted" }, p.repo) : null,
+        c && c.wip
+          ? h(Pill, { kind: "mc-pill-warn" }, "constraint · " + c.label + " · " + num(c.wip) + " waiting")
+          : h("span", { className: "mc-muted" }, "nothing in flight")),
+      !p.board_found
+        ? h("div", { className: "mc-muted" }, "no kanban board on this box yet, so there is no flow to measure")
+        : h(FlowPipe, { stages: stages, edges: p.edges, height: 170, label: p.name + " value stream" }),
+      p.board_found ? h(FlowStageGrid, { stages: stages }) : null,
+      c && c.wait_h != null
+        ? h("div", { className: "mc-row-m" },
+            h("span", null, num(c.queue_hours) + " queue-hours in the constraint"),
+            h("span", null, "~" + num(c.wait_h) + "h to clear at the measured exit rate"),
+            c.net_per_day != null ? h("span", null, "net " + (c.net_per_day > 0 ? "+" : "") + c.net_per_day + "/day") : null)
+        : null,
+      p.repo
+        ? h("div", { className: "mc-row-m" },
+            pl.measured
+              ? h("span", null, "PR/CI: " + num(pl.prs_open) + " open · " + num(pl.prs_merged_7d) + " merged in 7d · " +
+                  num((pl.ci || {}).failed_24h) + " CI failures 24h · " + num((pl.deploy || {}).in_progress) + " deploys running")
+              : h("span", { className: "mc-muted" }, pl.error ? "code pipeline unavailable: " + pl.error : "reading the code pipeline…"))
+        : null);
+  }
+
+  function FlowPanel() {
+    var poll = usePoll("/flow?window_hours=168", 60000);
+    var d = poll.state.data;
+    if (!d) return h(Panel, { title: "Project flow — where the work is stuck", sub: "loading…" },
+      h("div", { className: "mc-muted" }, "reading the boards…"));
+    var projects = (d.projects || []).filter(function (p) { return !p.unattached; });
+    var boards = (d.projects || []).filter(function (p) { return p.unattached; });
+    var constraints = projects.concat(boards)
+      .map(function (p) { return { p: p, c: (p.stages || []).find(function (s) { return s.constraint; }) }; })
+      .filter(function (x) { return x.c && x.c.wip > 0; })
+      .sort(function (a, b) { return (b.c.queue_hours || 0) - (a.c.queue_hours || 0); });
+    return h(Panel, {
+      title: "Project flow — where the work is stuck",
+      sub: (projects.length + boards.length) + " projects/boards · band thickness = cards in that stage now · updated " + hhmm(d.generated_at),
+      right: h("a", { className: "mc-link", href: "/mission-control" }, "auto-refresh 60s")
+    },
+      constraints.length
+        ? h("div", { className: "mc-flow-stages" }, constraints.slice(0, 6).map(function (x) {
+            var v = flowVerdict(Object.assign({}, x.c, { constraint: true }));
+            return h("div", { key: x.p.key, className: "mc-flow-stage", "data-tone": "hot" },
+              h("div", { className: "mc-flow-stage-h" },
+                h("span", { className: "mc-flow-stage-t" }, x.p.name),
+                h(Pill, { kind: "mc-pill-warn" }, x.c.label)),
+              h("div", { className: "mc-flow-stage-v" }, num(x.c.wip)),
+              h("div", { className: "mc-flow-stage-m" },
+                flowStageLine(Object.assign({}, x.c, { window_hours: x.p.window_hours }))));
+          }))
+        : h("div", { className: "mc-muted" }, "No stage is carrying a queue on any project right now."),
+      h("div", { className: "mc-cards" }, projects.concat(boards).map(function (p) {
+        return h(ProjectFlowBlock, { key: p.key, project: p });
+      })),
+      h("div", { className: "mc-muted" },
+        "Occupancy is live; flow counts are per-card stage events over 7d; the code leg (PR → CI → merge → deploy) is cached ~10 minutes because each read is a GitHub API call. " +
+        "A stage whose exit event is not instrumented says so instead of showing a zero."));
+  }
+
   function OverviewPage() {
     var poll = usePoll("/overview", 30000);
     var [board, setBoard] = useState("all");
@@ -374,6 +562,8 @@
             b.slug + " · " + Object.keys(b.counts || {}).reduce(function (n, k) { return n + b.counts[k]; }, 0));
         }),
         h("input", { className: "mc-input", placeholder: "filter…", value: q, onChange: function (e) { setQ(e.target.value); } })),
+
+      h(FlowPanel, null),
 
       h("div", { className: "mc-grid" },
         h("div", { className: "mc-cards" },

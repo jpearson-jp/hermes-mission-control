@@ -25,6 +25,7 @@ const INSIGHTS = '/mission-control/insights'
 const ESTATE = '/mission-control/estate'
 const WAITING_ON_ME = '/mission-control/waiting'
 const PROJECTS = '/mission-control/projects'
+const FLOW = '/mission-control/flow'
 
 const CSS = `
 .mc-page{display:flex;flex-direction:column;gap:14px;padding:14px 16px 40px;height:100%;overflow:auto}
@@ -89,6 +90,38 @@ const CSS = `
 .mc-tiles-sm .mc-tile-v, .mc-tiles-sm { font-size: 12px; }
 .mc-mono { font-family: var(--ui-font-mono, ui-monospace, monospace); font-size: 11px; color: var(--ui-text-tertiary); }
 .mc-dim { font-size: 11px; color: var(--ui-text-tertiary); }
+.mc-chip-on { border-color: var(--ui-accent); color: var(--ui-text-primary); }
+.mc-chip-hot { border-color: color-mix(in srgb,var(--ui-accent) 55%,var(--ui-stroke-secondary)); color: var(--ui-accent); }
+.mc-chip-warn { border-color: color-mix(in srgb,var(--ui-text-quaternary) 60%,var(--ui-stroke-secondary)); }
+.mc-chip-ok { border-color: color-mix(in srgb,var(--ui-text-quaternary) 40%,var(--ui-stroke-secondary)); }
+.mc-chip-dim { opacity: .6; }
+.mc-flow { display: flex; flex-direction: column; gap: 10px; }
+.mc-flow-svg { width: 100%; height: auto; display: block; }
+.mc-flow-band { stroke: var(--ui-stroke-secondary); }
+.mc-flow-band-ok { fill: color-mix(in srgb,var(--ui-accent) 26%,transparent); }
+.mc-flow-band-warn { fill: color-mix(in srgb,var(--ui-accent) 40%,transparent); }
+.mc-flow-band-hot { fill: color-mix(in srgb,var(--ui-accent) 62%,transparent); }
+.mc-flow-band-idle { fill: color-mix(in srgb,var(--ui-text-quaternary) 30%,transparent); }
+.mc-flow-band[data-hot=true] { stroke: var(--ui-accent); stroke-width: 1.5; }
+.mc-flow-link { fill: color-mix(in srgb,var(--ui-accent) 14%,transparent); }
+.mc-flow-link[data-idle=true] { fill: color-mix(in srgb,var(--ui-text-quaternary) 20%,transparent); }
+.mc-flow-rework { fill: none; stroke: var(--ui-text-quaternary); stroke-width: 1; stroke-dasharray: 3 3; }
+.mc-flow-num { font-size: 13px; font-weight: 600; fill: var(--ui-text-primary); }
+.mc-flow-lbl { font-size: 10px; fill: var(--ui-text-tertiary); }
+.mc-flow-stages { display: grid; grid-template-columns: repeat(auto-fit,minmax(168px,1fr)); gap: 8px; }
+.mc-flow-stage { border: 1px solid var(--ui-stroke-secondary); border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+.mc-flow-stage[data-tone=hot] { border-color: color-mix(in srgb,var(--ui-accent) 50%,var(--ui-stroke-secondary)); }
+.mc-flow-stage-h { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+.mc-flow-stage-t { font-size: 11.5px; color: var(--ui-text-primary); }
+.mc-flow-stage-v { font-size: 19px; font-weight: 600; line-height: 22px; color: var(--ui-text-primary); }
+.mc-flow-stage[data-tone=hot] .mc-flow-stage-v { color: var(--ui-accent); }
+.mc-flow-stage-m { font-size: 10px; color: var(--ui-text-tertiary); }
+.mc-rail { display: flex; flex-wrap: wrap; gap: 6px; }
+.mc-rail-box { border: 1px solid var(--ui-stroke-secondary); border-radius: 6px; padding: 5px 9px; display: flex; flex-direction: column; gap: 1px; }
+.mc-rail-box[data-hot=true] { border-color: color-mix(in srgb,var(--ui-accent) 50%,var(--ui-stroke-secondary)); }
+.mc-rail-k { font-size: 9px; text-transform: uppercase; letter-spacing: .07em; color: var(--ui-text-quaternary); }
+.mc-rail-v { font-size: 15px; font-weight: 600; color: var(--ui-text-primary); }
+.mc-rail-box[data-hot=true] .mc-rail-v { color: var(--ui-accent); }
 `
 
 // ---------------------------------------------------------------- helpers
@@ -974,6 +1007,11 @@ function ProjectsPage() {
   useCss()
   const p = useRest('/projects', 60000)
   const est = useRest('/estate', 300000)
+  // The same funnel data, so the project dashboard can name each project's constraint
+  // without the owner opening the Flow page.
+  const fl = useRest('/flow', 60000)
+  const flowByKey = {}
+  ;((fl.data || {}).projects || []).forEach(x => { flowByKey[x.key] = x })
   const [busy, setBusy] = useState(null)
   const [note, setNote] = useState(null)
   const d = p.data
@@ -1013,6 +1051,7 @@ function ProjectsPage() {
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Projects' }),
       jsx('div', { className: 'mc-sec-s', children: `${d.projects.length} project${d.projects.length === 1 ? '' : 's'} · from projects.db, merged across profiles by slug` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => { haptic('tap'); host.navigate(FLOW) }, children: 'Flow →' }),
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => invalidate(), children: 'refresh' })
     ] }),
     ...d.projects.map(pr => jsxs('div', { className: 'mc-card', children: [
@@ -1028,6 +1067,18 @@ function ProjectsPage() {
         jsx(Tile, { k: 'waiting on you', v: fmtNum(pr.asks), tone: pr.asks ? 'warn' : undefined, n: 'asks on this board' }),
         jsx(Tile, { k: 'bots', v: fmtNum(pr.bots.length), n: pr.failing ? `${pr.failing} with a failing job` : 'no failing jobs' })
       ] }),
+      (function () {
+        const f = flowByKey[pr.key]
+        const c = f && (f.stages || []).find(s => s.constraint)
+        if (!c || !c.wip) return null
+        return jsxs('div', { className: 'mc-row-m', children: [
+          jsx('span', { className: 'mc-chip mc-chip-hot', children: `constraint · ${c.label}` }),
+          jsx('span', { children: `${fmtNum(c.wip)} waiting` }),
+          jsx('span', { children: `${fmtNum(c.queue_hours)} queue-hours` }),
+          c.wait_h != null ? jsx('span', { children: `~${fmtNum(c.wait_h)}h to clear` }) : null,
+          jsx('a', { className: 'mc-link', onClick: () => { haptic('tap'); host.navigate(FLOW) }, children: 'see the flow' })
+        ] })
+      })(),
       pr.description ? jsx('div', { className: 'mc-dim', children: pr.description }) : null,
       jsxs('div', { className: 'mc-chips', children: [
         ...pr.bots.map(b => jsxs('span', { className: 'mc-chip', children: [
@@ -1058,6 +1109,356 @@ function ProjectsPage() {
     d.orphan_project_ids && d.orphan_project_ids.length
       ? jsx(Section, { title: 'Project ids with no project record', sub: `${d.orphan_project_ids.length}`, children: jsx('div', { className: 'mc-mono', children: d.orphan_project_ids.join(', ') }) })
       : null
+  ] })
+}
+
+// ---------------------------------------------------------------- Flow (the living value stream)
+//
+// A left-to-right funnel: one band per stage, band THICKNESS = how many cards are sitting in
+// that stage right now, so a stage with no load is a hairline and the widest band is where the
+// work has piled up. The named constraint is outlined; rework is drawn as a dashed return arc
+// under the spine; every stage carries a verdict so "flowing", "slowing", "backed up" and
+// "idle" read at a glance instead of being arithmetic in the reader's head.
+//
+// Everything is data-driven from /flow — stage ids, labels and counts all come from the payload,
+// so a stage added on the backend appears here without a UI change.
+
+const FLOW_TONE = {
+  ok: { chip: 'mc-chip mc-chip-ok', fill: 'mc-flow-band-ok' },
+  warn: { chip: 'mc-chip mc-chip-warn', fill: 'mc-flow-band-warn' },
+  hot: { chip: 'mc-chip mc-chip-hot', fill: 'mc-flow-band-hot' },
+  dim: { chip: 'mc-chip mc-chip-dim', fill: 'mc-flow-band-idle' }
+}
+
+function stageVerdict(s) {
+  if (!s.wip) return { key: 'idle', tone: 'dim', label: 'idle — no load' }
+  if (s.flow === 'n/a') return { key: 'count', tone: 'ok', label: 'count' }
+  if (s.constraint) return { key: 'constraint', tone: 'hot', label: 'CONSTRAINT' }
+  if (s.flow === 'unmeasured') return { key: 'queue', tone: 'warn', label: 'queue · exit not instrumented' }
+  if (s.wait_h == null) return { key: 'queue', tone: 'warn', label: 'no measured exit' }
+  if (s.wait_h <= 2) return { key: 'flowing', tone: 'ok', label: 'flowing' }
+  if (s.wait_h <= 12) return { key: 'slowing', tone: 'warn', label: 'slowing' }
+  return { key: 'backed', tone: 'hot', label: 'backed up' }
+}
+
+function stageLine(s) {
+  const bits = []
+  if (s.wip) bits.push(`${fmtNum(s.wip)} here`)
+  if (s.median_age_h != null) bits.push(`median ${s.median_age_h}h`)
+  if (s.oldest_age_h != null && s.oldest_age_h !== s.median_age_h) bits.push(`oldest ${s.oldest_age_h}h`)
+  if (s.flow === 'unmeasured') bits.push('flow not instrumented')
+  else if (s.flow !== 'n/a') bits.push(`${fmtNum(s.out)} out / ${s.window_hours || 168}h`)
+  if (s.wait_h != null && s.wip) bits.push(`~${fmtNum(s.wait_h)}h to clear`)
+  return bits.join(' · ')
+}
+
+/** The pipe: bands sized by WIP, links between them, rework arcs under the spine. */
+function FlowPipe({ stages, edges, height, ariaLabel }) {
+  const rows = (stages || []).filter(s => !s.terminal)
+  if (!rows.length) return jsx(EmptyState, { title: 'nothing in the flow' })
+  const W = 1000
+  const H = height || 200
+  const cy = H * 0.4
+  const maxWip = Math.max(1, ...rows.map(s => s.wip || 0))
+  const h = v => (v ? Math.max(3, (v / maxWip) * (H * 0.28)) : 1.5)
+  const slot = W / rows.length
+  const pad = Math.min(20, slot * 0.18)
+  const left = i => i * slot + pad
+  const right = i => (i + 1) * slot - pad
+  const centre = i => (left(i) + right(i)) / 2
+  const index = {}
+  rows.forEach((s, i) => { index[s.id] = i })
+
+  const children = []
+  for (let i = 0; i < rows.length - 1; i++) {
+    const a = h(rows[i].wip)
+    const b = h(rows[i + 1].wip)
+    const idle = !rows[i].wip && !rows[i + 1].wip
+    children.push(jsx('polygon', {
+      className: 'mc-flow-link',
+      'data-idle': idle ? 'true' : undefined,
+      points: [
+        `${right(i).toFixed(1)},${(cy - a / 2).toFixed(1)}`,
+        `${left(i + 1).toFixed(1)},${(cy - b / 2).toFixed(1)}`,
+        `${left(i + 1).toFixed(1)},${(cy + b / 2).toFixed(1)}`,
+        `${right(i).toFixed(1)},${(cy + a / 2).toFixed(1)}`
+      ].join(' ')
+    }, `link-${i}`))
+  }
+  rows.forEach((s, i) => {
+    const bh = h(s.wip)
+    children.push(jsx('rect', {
+      className: 'mc-flow-band ' + FLOW_TONE[stageVerdict(s).tone].fill,
+      'data-hot': s.constraint ? 'true' : undefined,
+      x: left(i).toFixed(1),
+      y: (cy - bh / 2).toFixed(1),
+      width: Math.max(2, right(i) - left(i)).toFixed(1),
+      height: bh.toFixed(1),
+      rx: 3
+    }, `band-${s.id}`))
+  })
+  rows.forEach((s, i) => {
+    children.push(jsx('text', {
+      className: 'mc-flow-num', textAnchor: 'middle',
+      x: centre(i).toFixed(1), y: (cy - H * 0.3).toFixed(1), children: fmtNum(s.wip)
+    }, `num-${s.id}`))
+    children.push(jsx('text', {
+      className: 'mc-flow-lbl', textAnchor: 'middle',
+      x: centre(i).toFixed(1), y: (H * 0.84).toFixed(1), children: s.label
+    }, `lbl-${s.id}`))
+  })
+
+  // Rework: the biggest two backward edges, drawn as return arcs so the picture
+  // shows work being redone rather than hiding it in a number.
+  const back = (edges || [])
+    .filter(e => e.direction === 'rework' && index[e.from] != null && index[e.to] != null)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 2)
+  back.forEach((e, k) => {
+    const a = index[e.from]
+    const b = index[e.to]
+    const y = H * (0.62 + k * 0.08)
+    children.push(jsx('path', {
+      className: 'mc-flow-rework',
+      d: `M ${centre(a).toFixed(1)},${(cy + h(rows[a].wip) / 2).toFixed(1)} C ${centre(a).toFixed(1)},${y.toFixed(1)} ` +
+         `${centre(b).toFixed(1)},${y.toFixed(1)} ${centre(b).toFixed(1)},${(cy + h(rows[b].wip) / 2).toFixed(1)}`
+    }, `rw-${e.from}-${e.to}`))
+    children.push(jsx('text', {
+      className: 'mc-flow-lbl', textAnchor: 'middle',
+      x: ((centre(a) + centre(b)) / 2).toFixed(1), y: (y + 3).toFixed(1),
+      children: `rework ${fmtNum(e.count)}`
+    }, `rwl-${e.from}-${e.to}`))
+  })
+
+  return jsx('svg', {
+    className: 'mc-flow-svg',
+    viewBox: `0 0 ${W} ${H}`,
+    preserveAspectRatio: 'none',
+    role: 'img',
+    'aria-label': ariaLabel || 'value stream',
+    // NOTE: children belongs IN props. Passing it as jsx()'s third argument makes it the KEY,
+    // which renders an empty <svg> — caught by the headless render check, invisible to
+    // `node --check`.
+    children
+  })
+}
+
+function StageTable({ stages }) {
+  const rows = (stages || []).filter(s => !s.terminal)
+  return jsx('div', { className: 'mc-flow-stages', children: rows.map(s => {
+    const v = stageVerdict(s)
+    return jsxs('div', { className: 'mc-flow-stage', 'data-tone': v.tone, children: [
+      jsxs('div', { className: 'mc-flow-stage-h', children: [
+        jsx('span', { className: 'mc-flow-stage-t', children: s.label }),
+        jsx('span', { className: FLOW_TONE[v.tone].chip, children: v.label })
+      ] }),
+      jsx('div', { className: 'mc-flow-stage-v', children: fmtNum(s.wip) }),
+      jsx('div', { className: 'mc-flow-stage-m', children: stageLine(s) })
+    ] }, s.id)
+  }) })
+}
+
+/** The code leg, mapped into the same shape so it draws with the same pipe. */
+function pipelineStages(pl) {
+  if (!pl || !pl.measured) return []
+  const b = pl.pr_buckets || {}
+  const dp = pl.deploy || {}
+  const mk = (id, label, wip, extra) => Object.assign({
+    id, label, wip: wip || 0, terminal: false, flow: 'n/a'
+  }, extra || {})
+  return [
+    mk('pr_open', 'PRs open', pl.prs_open, { median_age_h: pl.pr_age_median_h, oldest_age_h: pl.pr_age_oldest_h }),
+    mk('ci_run', 'CI running', b.ci_running),
+    mk('ci_fail', 'CI failing', b.ci_failing),
+    mk('conflict', 'Conflicts', b.conflicts),
+    mk('review', 'Awaiting review', b.awaiting_review),
+    mk('mergeable', 'Ready to merge', b.mergeable),
+    mk('merged', 'Merged 7d', pl.prs_merged_7d),
+    mk('deploy', 'Deploys running', dp.in_progress)
+  ]
+}
+
+function PipelineLeg({ pl, repo }) {
+  if (!repo) {
+    return jsx('div', { className: 'mc-dim', children: 'No git remote resolved for this project, so there is no PR/CI/deploy leg to measure.' })
+  }
+  if (!pl) return jsx('div', { className: 'mc-dim', children: 'reading the code pipeline…' })
+  if (pl.error) return jsx('div', { className: 'mc-note', children: `code pipeline unavailable: ${pl.error}` })
+  if (!pl.measured) {
+    return jsxs('div', { className: 'mc-dim', children: [
+      'reading GitHub for ', jsx('span', { className: 'mc-mono', children: repo }),
+      '… the first read takes a few seconds and this panel never blocks on it.'
+    ] })
+  }
+  const stages = pipelineStages(pl)
+  const dp = pl.deploy || {}
+  const ci = pl.ci || {}
+  return jsxs('div', { className: 'mc-flow', children: [
+    jsx(FlowPipe, { stages, height: 150, ariaLabel: `${repo} PR and CI pipeline` }),
+    jsxs('div', { className: 'mc-row-m', children: [
+      jsx('span', { className: 'mc-mono', children: repo }),
+      jsx('span', { children: `${fmtNum(pl.prs_open)} open PRs` }),
+      pl.pr_age_oldest_h != null ? jsx('span', { children: `oldest PR ${pl.pr_age_oldest_h}h` }) : null,
+      pl.pr_merge_lead_h != null ? jsx('span', { children: `open→merge ${pl.pr_merge_lead_h}h` }) : null,
+      jsx('span', { children: `${fmtNum(pl.prs_merged_7d)} merged in 7d` }),
+      jsx('span', { children: `CI 24h: ${fmtNum(ci.ok_24h)} ok / ${fmtNum(ci.failed_24h)} failed` }),
+      jsx('span', { children: `deploy 24h: ${fmtNum(dp.ok_24h)} ok / ${fmtNum(dp.failed_24h)} failed` }),
+      pl.refreshing
+        ? jsx('span', { className: 'mc-dim', children: 'refreshing…' })
+        : jsx('span', { className: 'mc-dim', children: `as of ${Math.round(pl.cache_age_seconds || 0)}s ago` })
+    ] }),
+    dp.names && dp.names.length
+      ? jsx('div', { className: 'mc-mono', children: `deploy workflows on main: ${dp.names.join(' · ')}` })
+      : jsx('div', { className: 'mc-dim', children: 'no deploy workflow run on main in the last 100 runs — that leg is idle.' }),
+    pl.partial && pl.partial.length
+      ? jsx('div', { className: 'mc-note', children: `partial read (${pl.partial.join(', ')} failed) — treat these numbers as incomplete.` })
+      : null
+  ] })
+}
+
+function RailStrip({ rails }) {
+  const rows = (rails || []).filter(r => r.wip || r.entered)
+  if (!rows.length) return jsx('div', { className: 'mc-dim', children: 'Nothing is parked on this board.' })
+  return jsx('div', { className: 'mc-rail', children: rows.map(r =>
+    jsxs('div', { className: 'mc-rail-box', 'data-hot': r.wip > 20 ? 'true' : undefined, children: [
+      jsx('div', { className: 'mc-rail-k', children: r.label }),
+      jsx('div', { className: 'mc-rail-v', children: fmtNum(r.wip) }),
+      jsx('div', { className: 'mc-dim', children: `${fmtNum(r.entered)} parked in 7d` })
+    ] }, r.id)) })
+}
+
+function ReworkStrip({ project }) {
+  const label = id => {
+    const s = (project.stages || []).find(x => x.id === id)
+    return s ? s.label : id
+  }
+  const rows = (project.edges || []).filter(e => e.direction === 'rework' && e.count > 0)
+  if (!rows.length) return jsx('div', { className: 'mc-dim', children: 'No rework edges measured in this window.' })
+  return jsxs('div', { className: 'mc-flow', children: [
+    jsx('div', { className: 'mc-row-m', children: rows.map(e =>
+      jsx('span', { className: 'mc-chip', children: `${label(e.from)} → ${label(e.to)} · ${fmtNum(e.count)}` }, `${e.from}-${e.to}`)) }),
+    jsx('div', { className: 'mc-dim', children: `${fmtNum(project.rework)} card moves went BACKWARD through the line in this window — work being redone, not new work.` })
+  ] })
+}
+
+function ProjectFlowCard({ project, initialOpen }) {
+  const [open, setOpen] = useState(!!initialOpen)
+  const stages = project.stages || []
+  const constraint = stages.find(s => s.constraint)
+  const onLine = stages.reduce((n, s) => n + (s.wip || 0), 0)
+  return jsxs('div', { className: 'mc-card', children: [
+    jsxs('div', { className: 'mc-card-h', children: [
+      jsx(Badge, { children: project.unattached ? 'board' : 'project' }),
+      jsx('span', { className: 'mc-card-t-inline', children: project.name }),
+      jsx('span', { className: 'mc-mono', children: `board ${project.board}` }),
+      project.repo ? jsx('span', { className: 'mc-mono', children: project.repo }) : null,
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => { haptic('tap'); setOpen(!open) }, children: open ? 'collapse' : 'expand' })
+    ] }),
+    project.error ? jsx('div', { className: 'mc-note', children: `board read failed: ${project.error}` }) : null,
+    project.board_found ? null
+      : jsx('div', { className: 'mc-note', children: 'No kanban board on this box for this project yet, so there is no flow to measure.' }),
+    constraint
+      ? jsxs('div', { className: 'mc-row-m', children: [
+        jsx('span', { className: 'mc-chip mc-chip-hot', children: `CONSTRAINT · ${constraint.label}` }),
+        jsx('span', { children: `${fmtNum(constraint.wip)} waiting` }),
+        jsx('span', { children: `${fmtNum(constraint.queue_hours)} queue-hours` }),
+        constraint.wait_h != null
+          ? jsx('span', { children: `~${fmtNum(constraint.wait_h)}h to clear at the measured exit rate` })
+          : jsx('span', { children: 'exit rate not instrumented' }),
+        constraint.net_per_day != null
+          ? jsx('span', { children: `net ${constraint.net_per_day > 0 ? '+' : ''}${constraint.net_per_day}/day` })
+          : null
+      ] })
+      : (project.board_found ? jsx('div', { className: 'mc-dim', children: 'Nothing in flight on this board.' }) : null),
+    open ? jsxs('div', { className: 'mc-flow', children: [
+      jsx(FlowPipe, { stages, edges: project.edges, height: 200, ariaLabel: `${project.name} value stream` }),
+      jsx(StageTable, { stages }),
+      jsx(Section, { title: 'Parked work — the side rails', sub: 'what left the line, and why',
+        children: jsx(RailStrip, { rails: project.rails }) }),
+      jsx(Section, { title: 'Rework — cards moving backward', children: jsx(ReworkStrip, { project }) }),
+      jsx(Section, { title: 'Code leg — PR → CI → merge → deploy', sub: project.repo || 'no repo resolved',
+        children: jsx(PipelineLeg, { pl: project.pipeline, repo: project.repo }) }),
+      jsxs('div', { className: 'mc-row-m', children: [
+        jsx('span', { children: `${fmtNum(onLine)} cards on the line` }),
+        jsx('span', { children: `${fmtNum(project.done_total)} shipped all-time` }),
+        jsx('span', { children: `${fmtNum(project.churn)} runs crashed or gave up in window` }),
+        jsx('span', { className: 'mc-dim', children: `flow window ${project.window_hours}h` })
+      ] })
+    ] }) : null
+  ] }, project.key)
+}
+
+function FlowPage() {
+  useCss()
+  const [windowHours, setWindowHours] = useState(168)
+  const [only, setOnly] = useState(null)
+  const q = useRest('/flow?window_hours=' + windowHours, 30000)
+  const d = q.data
+  const projects = (d || {}).projects || []
+  const shown = only ? projects.filter(p => p.key === only) : projects
+
+  if (q.isError) {
+    return jsxs('div', { className: 'mc-page', children: [
+      jsx(ErrorState, { title: 'The flow is unreachable' }) ] })
+  }
+  if (!d) return jsxs('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
+
+  const constraints = projects
+    .map(p => ({ p, c: (p.stages || []).find(s => s.constraint) }))
+    .filter(x => x.c && x.c.wip > 0)
+    .sort((a, b) => (b.c.queue_hours || 0) - (a.c.queue_hours || 0))
+
+  return jsxs('div', { className: 'mc-page', children: [
+    jsxs('div', { className: 'mc-head', children: [
+      jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Flow' }),
+      jsx('div', { className: 'mc-sec-s', children: `value stream for ${projects.length} project${projects.length === 1 ? '' : 's'} · updated ${ago(d.generated_at)} · auto-refresh 30s` }),
+      jsx('div', { style: { flex: '1 1 auto' } }),
+      [168, 336, 720].map(h => jsx(Button, {
+        key: h, variant: 'ghost', size: 'sm', disabled: windowHours === h,
+        onClick: () => { haptic('tap'); setWindowHours(h) }, children: `${h / 24}d`
+      }, h)),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => void invalidate(), children: 'refresh' })
+    ] }),
+
+    jsx(Section, {
+      title: 'Where the work is stuck',
+      sub: 'ranked by queue-hours — how long the cards sitting there have already waited, added up',
+      children: constraints.length
+        ? jsx('div', { className: 'mc-flow-stages', children: constraints.map(x => jsxs('div', {
+          className: 'mc-flow-stage', 'data-tone': 'hot', children: [
+            jsxs('div', { className: 'mc-flow-stage-h', children: [
+              jsx('span', { className: 'mc-flow-stage-t', children: x.p.name }),
+              jsx('span', { className: 'mc-chip mc-chip-hot', children: x.c.label })
+            ] }),
+            jsx('div', { className: 'mc-flow-stage-v', children: fmtNum(x.c.wip) }),
+            jsx('div', { className: 'mc-flow-stage-m', children: stageLine(Object.assign({}, x.c, { window_hours: x.p.window_hours })) })
+          ]
+        }, x.p.key)) })
+        : jsx('div', { className: 'mc-dim', children: 'No stage is carrying a queue on any project right now.' })
+    }),
+
+    jsxs('div', { className: 'mc-chips', children: [
+      jsx('button', { className: 'mc-chip' + (only ? '' : ' mc-chip-on'), onClick: () => setOnly(null), children: 'every project' }),
+      projects.map(p => jsx('button', {
+        key: p.key, className: 'mc-chip' + (only === p.key ? ' mc-chip-on' : ''),
+        onClick: () => { haptic('tap'); setOnly(only === p.key ? null : p.key) }, children: p.name
+      }, p.key))
+    ] }),
+
+    shown.map(p => jsx(ProjectFlowCard, {
+      key: p.key, project: p, initialOpen: !p.unattached
+    }, p.key)),
+
+    jsx(Section, {
+      title: 'How to read this',
+      children: jsxs('div', { className: 'mc-flow', children: [
+        jsx('div', { className: 'mc-row-m', children: 'Band thickness is how many cards are in that stage right now — a hairline means no load at all, and the widest band is where work has piled up. The outlined band is the constraint.' }),
+        jsx('div', { className: 'mc-row-m', children: 'Each stage is labelled flowing (under ~2h to clear), slowing, backed up, idle, or a queue whose exit is not instrumented — that last case is reported as unmeasured rather than as a zero.' }),
+        jsx('div', { className: 'mc-row-m', children: `Occupancy is live. Flow counts are per-card stage events over the last ${windowHours}h. The code leg is cached about 10 minutes because every read is a GitHub API call.` }),
+        jsx('div', { className: 'mc-row-m', children: 'Projects come from projects.db; boards with no project record are shown too, so no work is invisible.' })
+      ] })
+    })
   ] })
 }
 
@@ -1111,6 +1512,16 @@ export default {
       { id: 'estate', area: ROUTES_AREA, data: { path: ESTATE }, render: () => jsx(EstatePage, {}) },
       { id: 'waiting', area: ROUTES_AREA, data: { path: WAITING_ON_ME }, render: () => jsx(WaitingOnMePage, {}) },
       { id: 'projects', area: ROUTES_AREA, data: { path: PROJECTS }, render: () => jsx(ProjectsPage, {}) },
+      { id: 'flow', area: ROUTES_AREA, data: { path: FLOW }, render: () => jsx(FlowPage, {}) },
+      { id: 'nav-flow', area: SIDEBAR_NAV_AREA, data: { path: FLOW, label: 'Flow', codicon: 'graph-line' } },
+      {
+        id: 'open-flow', area: PALETTE_AREA,
+        data: {
+          id: 'mission-control.flow', label: 'Mission Control: flow (where the work is stuck)',
+          keywords: ['mission', 'control', 'flow', 'funnel', 'value stream', 'bottleneck', 'constraint', 'pipeline'],
+          run: () => host.navigate(FLOW)
+        }
+      },
       { id: 'nav-estate', area: SIDEBAR_NAV_AREA, data: { path: ESTATE, label: 'Estate', codicon: 'server-process' } },
       { id: 'nav-waiting', area: SIDEBAR_NAV_AREA, data: { path: WAITING_ON_ME, label: 'Waiting on Me', codicon: 'inbox' } },
       { id: 'nav-projects', area: SIDEBAR_NAV_AREA, data: { path: PROJECTS, label: 'Projects', codicon: 'briefcase' } },

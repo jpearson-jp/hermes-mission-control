@@ -138,3 +138,29 @@ a.mc-link:hover { text-decoration: underline; }
 .mc-hbar-fill { height: 100%; border-radius: 3px; }
 .mc-hbar-v { text-align: right; font-variant-numeric: tabular-nums; }
 .mc-tags { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+
+/* --- project flow / value stream --- */
+.mc-flow-proj { display: flex; flex-direction: column; gap: .35rem; border: 1px solid var(--color-border);
+  border-radius: var(--radius, .5rem); padding: .5rem .6rem; }
+.mc-flow-proj-h { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; }
+.mc-flow-svg { width: 100%; height: auto; display: block; }
+.mc-flow-band { stroke: var(--color-border); }
+.mc-flow-band-ok { fill: color-mix(in srgb, #3fd3ff 26%, transparent); }
+.mc-flow-band-warn { fill: color-mix(in srgb, #ffce3a 40%, transparent); }
+.mc-flow-band-hot { fill: color-mix(in srgb, #ff5d5d 45%, transparent); }
+.mc-flow-band-dim { fill: color-mix(in srgb, var(--color-border) 80%, transparent); }
+.mc-flow-band[data-hot=true] { stroke: #ff5d5d; stroke-width: 1.5; }
+.mc-flow-link { fill: color-mix(in srgb, #3fd3ff 14%, transparent); }
+.mc-flow-link[data-idle=true] { fill: color-mix(in srgb, var(--color-border) 60%, transparent); }
+.mc-flow-rework { fill: none; stroke: var(--color-muted-foreground); stroke-width: 1; stroke-dasharray: 3 3; }
+.mc-flow-num { font-size: 13px; font-weight: 600; fill: var(--color-foreground); }
+.mc-flow-lbl { font-size: 10px; fill: var(--color-muted-foreground); }
+.mc-flow-stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: .45rem; }
+.mc-flow-stage { border: 1px solid var(--color-border); border-radius: var(--radius, .5rem); padding: .4rem .55rem;
+  display: flex; flex-direction: column; gap: .1rem; }
+.mc-flow-stage[data-tone=hot] { border-color: color-mix(in srgb, #ff5d5d 50%, var(--color-border)); }
+.mc-flow-stage-h { display: flex; gap: .4rem; align-items: center; justify-content: space-between; }
+.mc-flow-stage-t { font-size: .74rem; }
+.mc-flow-stage-v { font-size: 1.15rem; font-weight: 650; line-height: 1.25; }
+.mc-flow-stage[data-tone=hot] .mc-flow-stage-v { color: #ff5d5d; }
+.mc-flow-stage-m { font-size: .66rem; color: var(--color-muted-foreground); }

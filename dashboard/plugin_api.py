@@ -36,6 +36,7 @@ from hermes_cli import kanban_db
 from hermes_cli import kanban_db_connect as kbc
 import subprocess
 import sys
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -1800,3 +1801,538 @@ def projects_archive(body: ProjectArchiveBody):
         for b in bots:
             moved.append(_cron_set(b, "pause" if archived else "resume"))
     return {"ok": True, "key": key, "status": entry["status"], "bots": bots, "cron": moved}
+
+
+# ---------------------------------------------------------------------------
+# Flow / value stream — where the work is, how fast it moves, and what the
+# constraint is. One funnel per project, live, plus the PR/CI/deploy leg.
+#
+# The measurement model, stated so the numbers cannot drift from their meaning:
+#
+#   * OCCUPANCY is a snapshot — `tasks.status` (+ `block_kind`) right now.
+#   * FLOW is a window count — per-card stage-marker events in time order; an
+#     edge A->B counts cards whose consecutive markers were A then B, so a card
+#     that skips a stage records the edge it actually took (no invented traffic)
+#     and rework shows up as a BACKWARD edge.
+#   * DWELL is measured on the CURRENT occupants of a stage (median + oldest).
+#   * The CONSTRAINT is ranked on queue-hours (wip x dwell — always measurable,
+#     including stages whose exit event is not instrumented), with Little's-law
+#     wait (wip / measured exit rate) shown beside it.
+#
+# A stage whose exit event is not instrumented reports `flow: "unmeasured"`
+# rather than a zero, because "could not measure" is not "none moved".
+# ---------------------------------------------------------------------------
+
+_FLOW_STAGES = (
+    ("filed", "Filed", "triage"),
+    ("backlog", "Backlog", "todo"),
+    ("ready", "Ready", "ready"),
+    ("build", "In build", "running"),
+    ("review", "In review", "review"),
+    ("publish", "Awaiting publication", "awaiting_publication"),
+    ("done", "Shipped", "done"),
+)
+_FLOW_COLUMN = {sid: col for sid, _, col in _FLOW_STAGES}
+_FLOW_LABEL = {sid: lab for sid, lab, _ in _FLOW_STAGES}
+_FLOW_ORDER = {sid: i for i, (sid, _, _) in enumerate(_FLOW_STAGES)}
+_FLOW_COLUMN_INV = {col: sid for sid, _, col in _FLOW_STAGES}
+# Event kind -> the stage it records entry into. Only events that NAME a stage
+# are here; anything absent is reported as unmeasured rather than guessed.
+_FLOW_MARKERS = {
+    "created": "filed",
+    "promoted": "ready",           # `promoted` is the renamed `ready` event
+    "spawned": "build",
+    "reclaimed": "build",
+    "changes_requested": "build",  # rework: review -> build
+    "review_requested": "review",
+    "review_reopened": "review",
+    "completed": "done",
+}
+_FLOW_CHURN_EVENTS = ("crashed", "gave_up", "spawn_failed", "respawn_guarded", "block_loop_detected")
+_FLOW_RAILS = (
+    ("needs_input", "Needs you"),
+    ("capability", "No capability"),
+    ("dependency", "Dependency"),
+    ("transient", "Transient"),
+)
+# Stages whose exit event is genuinely instrumented. Backlog has no event that
+# says "left todo"; `done` is terminal.
+_FLOW_UNMEASURED = ("backlog", "done")
+
+_GH_TTL_SECONDS = 600.0
+_GH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_GH_INFLIGHT: set[str] = set()
+_GH_CACHE_LOCK = threading.Lock()
+
+
+def _flow_payload_kind(payload: Optional[str]) -> Optional[str]:
+    """The `kind` field of a park event payload — parsed, never LIKE-matched.
+
+    MEASURED 2026-09-19: a `LIKE '%awaiting_publication%'` test matched 319 rows
+    on the tos board where the true count was 211, because the park REASON text of
+    a `needs_input` park discusses publication at length. Only the JSON field is
+    the block kind.
+    """
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except Exception:                                               # noqa: BLE001
+        return None
+    return data.get("kind") if isinstance(data, dict) else None
+
+
+def _flow_payload_fields(payload: Optional[str]) -> dict[str, Any]:
+    """The parsed park-event payload, or {} — the JSON fields only, never prose."""
+    if not payload:
+        return {}
+    try:
+        data = json.loads(payload)
+    except Exception:                                               # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _flow_median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _board_workdir(slug: str) -> Optional[str]:
+    """A board's default workdir, straight from the library enumeration."""
+    try:
+        for entry in kanban_db.list_boards(include_archived=True):
+            if entry.get("slug") == slug:
+                return entry.get("default_workdir")
+    except Exception:                                               # noqa: BLE001
+        log.debug("list_boards failed while resolving %s", slug, exc_info=True)
+    return None
+
+
+def _repo_from_path(path: Optional[str]) -> Optional[str]:
+    """`owner/name` for a checkout, read from .git/config (never the network)."""
+    if not path:
+        return None
+    cfg = Path(path) / ".git" / "config"
+    if not cfg.is_file():
+        # a linked worktree: .git is a FILE pointing at the real gitdir
+        gitfile = Path(path) / ".git"
+        if gitfile.is_file():
+            try:
+                target = gitfile.read_text().strip().split("gitdir:", 1)[-1].strip()
+                cfg = Path(target) / "config"
+            except Exception:                                       # noqa: BLE001
+                return None
+    try:
+        text = cfg.read_text()
+    except Exception:                                               # noqa: BLE001
+        return None
+    match = re.search(r'\[remote "origin"\][^\[]*?url\s*=\s*(\S+)', text)
+    if not match:
+        return None
+    slug = re.search(r"github\.com[:/]+([^/]+/[^/\s]+?)(?:\.git)?$", match.group(1))
+    return slug.group(1) if slug else None
+
+
+def _gh_json(args: list[str], timeout: int = 45) -> dict[str, Any]:
+    """Run a `gh` command and parse its JSON. Never raises."""
+    try:
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {"ok": False, "error": "gh not installed"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"gh timed out after {timeout}s"}
+    except Exception as exc:                                        # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {"ok": False, "error": detail[0][:200] if detail else f"gh exit {proc.returncode}"}
+    try:
+        return {"ok": True, "data": json.loads(proc.stdout or "[]")}
+    except Exception as exc:                                        # noqa: BLE001
+        return {"ok": False, "error": f"unparseable gh output: {exc}"}
+
+
+def _pr_ci_state(pr: dict[str, Any]) -> str:
+    """Bucket one open PR by what is actually holding it."""
+    if pr.get("isDraft"):
+        return "draft"
+    merge = (pr.get("mergeStateStatus") or "").upper()
+    if merge == "DIRTY":
+        return "conflicts"
+    checks = pr.get("statusCheckRollup") or []
+    states = [str(c.get("conclusion") or c.get("status") or c.get("state") or "").upper() for c in checks]
+    if any(s in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+           for s in states):
+        return "ci_failing"
+    if any(s in ("IN_PROGRESS", "QUEUED", "PENDING") for s in states):
+        return "ci_running"
+    if merge == "BEHIND":
+        return "behind"
+    if merge == "BLOCKED" or (pr.get("reviewDecision") or "") == "REVIEW_REQUIRED":
+        return "awaiting_review"
+    if merge == "CLEAN":
+        return "mergeable"
+    return "open"
+
+
+def _deploy_ish(name: str) -> bool:
+    low = (name or "").lower()
+    if "deploy" in low or "promote" in low or "publish" in low:
+        return True
+    return "release" in low and "pre-release" not in low and "prerelease" not in low
+
+
+def _gh_pipeline(repo: str) -> dict[str, Any]:
+    """The slow half: three `gh` reads for one repo. Runs OFF the request path."""
+    now = time.time()
+    out: dict[str, Any] = {"repo": repo, "measured": False}
+    open_prs = _gh_json(["pr", "list", "-R", repo, "--state", "open", "--limit", "200", "--json",
+                         "number,title,isDraft,mergeStateStatus,reviewDecision,headRefName,"
+                         "createdAt,updatedAt,statusCheckRollup"])
+    merged = _gh_json(["pr", "list", "-R", repo, "--state", "merged", "--limit", "100", "--json",
+                       "number,mergedAt,createdAt"])
+    runs = _gh_json(["api", f"repos/{repo}/actions/runs?per_page=100&branch=main"])
+
+    if not open_prs.get("ok") and not merged.get("ok") and not runs.get("ok"):
+        out["error"] = open_prs.get("error") or merged.get("error") or runs.get("error")
+        return out
+
+    buckets: dict[str, int] = {}
+    ages: list[float] = []
+    oldest = 0.0
+    if open_prs.get("ok"):
+        for pr in open_prs["data"]:
+            key = _pr_ci_state(pr)
+            buckets[key] = buckets.get(key, 0) + 1
+            stamp = pr.get("createdAt")
+            if stamp:
+                try:
+                    age = (now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()) / 3600.0
+                    ages.append(age)
+                    oldest = max(oldest, age)
+                except Exception:                                   # noqa: BLE001
+                    pass
+    merged_n, merge_lead = 0, []
+    if merged.get("ok"):
+        cutoff = now - 7 * 86400
+        for pr in merged["data"]:
+            try:
+                m = datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")).timestamp()
+            except Exception:                                       # noqa: BLE001
+                continue
+            if m >= cutoff:
+                merged_n += 1
+            try:
+                c = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00")).timestamp()
+                merge_lead.append((m - c) / 3600.0)
+            except Exception:                                       # noqa: BLE001
+                pass
+
+    deploy = {"in_progress": 0, "failed_24h": 0, "ok_24h": 0, "total": 0, "last_at": None, "names": []}
+    ci_runs = {"in_progress": 0, "failed_24h": 0, "ok_24h": 0, "total": 0}
+    if runs.get("ok"):
+        cutoff24 = now - 86400
+        for run in (runs["data"].get("workflow_runs") or []):
+            name = run.get("name") or ""
+            try:
+                created = datetime.fromisoformat(str(run.get("created_at")).replace("Z", "+00:00")).timestamp()
+            except Exception:                                       # noqa: BLE001
+                created = 0.0
+            target = deploy if _deploy_ish(name) else ci_runs
+            target["total"] += 1
+            if run.get("status") != "completed":
+                target["in_progress"] += 1
+            if created >= cutoff24:
+                if run.get("conclusion") == "failure":
+                    target["failed_24h"] += 1
+                elif run.get("conclusion") == "success":
+                    target["ok_24h"] += 1
+            if target is deploy:
+                if deploy["last_at"] is None or (run.get("created_at") or "") > deploy["last_at"]:
+                    deploy["last_at"] = run.get("created_at")
+                if name and name not in deploy["names"] and len(deploy["names"]) < 6:
+                    deploy["names"].append(name)
+
+    out.update({
+        "measured": True,
+        "prs_open": sum(buckets.values()),
+        "pr_buckets": buckets,
+        "pr_age_median_h": round(_flow_median(ages), 1) if ages else None,
+        "pr_age_oldest_h": round(oldest, 1) if oldest else None,
+        "prs_merged_7d": merged_n,
+        "pr_merge_lead_h": round(_flow_median(merge_lead), 1) if merge_lead else None,
+        "ci": ci_runs,
+        "deploy": deploy,
+        "partial": [label for label, res in
+                    (("open_prs", open_prs), ("merged", merged), ("runs", runs)) if not res.get("ok")],
+    })
+    return out
+
+
+def _gh_refresh(repo: str) -> None:
+    """Single-flight background refresh: one `gh` burst per repo per TTL."""
+    try:
+        result = _gh_pipeline(repo)
+    except Exception as exc:                                        # noqa: BLE001
+        result = {"repo": repo, "measured": False, "error": f"{type(exc).__name__}: {exc}"}
+    with _GH_CACHE_LOCK:
+        _GH_CACHE[repo] = (time.time(), result)
+        _GH_INFLIGHT.discard(repo)
+
+
+def _code_pipeline(repo: str) -> dict[str, Any]:
+    """The PR/CI/deploy leg for one repo.
+
+    NEVER blocks a request on the network: a cold repo answers `warming`, a stale
+    repo answers its previous reading with `refreshing: true`, and the refresh runs
+    on a daemon thread. `gh` reads are expensive (the open-PR read with check
+    rollups measured 7.3s) and every one is a call against the shared token, so
+    one burst per repo per TTL is the whole budget.
+    """
+    now = time.time()
+    with _GH_CACHE_LOCK:
+        hit = _GH_CACHE.get(repo)
+        if hit and now - hit[0] < _GH_TTL_SECONDS:
+            return {**hit[1], "cache_age_seconds": round(now - hit[0], 1), "refreshing": False}
+        starting = repo not in _GH_INFLIGHT
+        if starting:
+            _GH_INFLIGHT.add(repo)
+    if starting:
+        threading.Thread(target=_gh_refresh, args=(repo,), daemon=True,
+                         name=f"mc-flow-gh-{repo.split('/')[-1]}").start()
+    if hit:
+        return {**hit[1], "cache_age_seconds": round(now - hit[0], 1), "refreshing": True}
+    return {"repo": repo, "measured": False, "warming": True, "refreshing": True,
+            "cache_age_seconds": None}
+
+
+def _flow_for_board(db_path: str, window_hours: int, now: int) -> dict[str, Any]:
+    """Occupancy + measured flow + dwell for one kanban board."""
+    since = now - window_hours * 3600
+    days = max(window_hours / 24.0, 1e-9)
+    columns = set(_FLOW_COLUMN.values())
+    with closing(_ro(db_path)) as conn:
+        wip: dict[str, int] = {}
+        done_total = 0
+        rail_wip = {key: 0 for key, _ in _FLOW_RAILS}
+        parked: list[dict[str, Any]] = []
+        for row in _q(conn, "SELECT id, status, COALESCE(block_kind,'') bk, created_at FROM tasks"):
+            status, kind = row["status"], row["bk"]
+            if status == "done":
+                done_total += 1
+            elif status in columns:
+                wip[status] = wip.get(status, 0) + 1
+            if kind in rail_wip:
+                rail_wip[kind] += 1
+            if status in ("blocked", "triage", "awaiting_publication"):
+                parked.append({"id": row["id"], "status": status, "bk": kind,
+                               "created_at": int(row["created_at"] or 0)})
+
+        # -- markers, park episodes, churn ------------------------------------
+        markers: dict[str, list[tuple[int, str]]] = {}
+        park_start: dict[str, int] = {}
+        last_park: dict[str, tuple[str, str]] = {}   # task -> (block kind, source_status)
+        rail_entered = {key: 0 for key, _ in _FLOW_RAILS}
+        publish_entered = 0
+        churn = 0
+        for row in _q(conn, "SELECT task_id, kind, payload, created_at FROM task_events "
+                            "WHERE kind != 'heartbeat' ORDER BY task_id, id"):
+            kind, tid, ts = row["kind"], row["task_id"], int(row["created_at"])
+            if kind == "blocked":
+                fields = _flow_payload_fields(row["payload"])
+                payload_kind = fields.get("kind")
+                last_park[tid] = (str(payload_kind or ""), str(fields.get("source_status") or ""))
+                if ts >= since:
+                    if payload_kind in rail_entered:
+                        rail_entered[payload_kind] += 1
+                    if payload_kind == "awaiting_publication":
+                        publish_entered += 1
+                        markers.setdefault(tid, []).append((ts, "publish"))
+                # Episode start: the FIRST block since the last act that left a
+                # park. A card re-parked with the same reason keeps its original
+                # start, which is exactly what a bottleneck view has to show.
+                if park_start.get(tid) is None:
+                    park_start[tid] = ts
+                continue
+            if kind == "unblocked":
+                park_start.pop(tid, None)
+                prev = last_park.pop(tid, None)
+                if prev and prev[0] == "awaiting_publication" and ts >= since:
+                    # The card came back OUT of the publication queue into the
+                    # stage it was parked from — a measured exit, and a rework
+                    # edge the funnel has to draw.
+                    src = _FLOW_COLUMN_INV.get(prev[1] or "")
+                    if src and src != "publish":
+                        markers.setdefault(tid, []).append((ts, src))
+                continue
+            if kind in ("completed", "spawned", "promoted", "created", "review_requested"):
+                park_start.pop(tid, None)
+                last_park.pop(tid, None)
+            if kind == "dependency_wait":
+                # A dependency park is recorded as `dependency_wait`, NOT as a
+                # `blocked` event carrying kind=dependency — so the rail's entry
+                # count has to come from here or it reads a permanent zero.
+                if ts >= since:
+                    rail_entered["dependency"] += 1
+                continue
+            if ts >= since and kind in _FLOW_CHURN_EVENTS:
+                churn += 1
+            stage = _FLOW_MARKERS.get(kind)
+            if stage and ts >= since:
+                markers.setdefault(tid, []).append((ts, stage))
+
+        edges: dict[tuple[str, str], int] = {}
+        for _tid, seq in markers.items():
+            seq.sort()
+            for (_, a), (_, b) in zip(seq, seq[1:]):
+                if a != b:
+                    edges[(a, b)] = edges.get((a, b), 0) + 1
+
+        # -- dwell of the CURRENT occupants -----------------------------------
+        ages: dict[str, list[float]] = {sid: [] for sid, _, _ in _FLOW_STAGES}
+        for row in _q(conn, "SELECT status, created_at FROM tasks "
+                            "WHERE status IN ('triage','todo','ready')"):
+            ages[_FLOW_COLUMN_INV[row["status"]]].append(now - int(row["created_at"] or now))
+        for row in _q(conn, "SELECT COALESCE(tr.started_at, t.created_at) ts FROM tasks t "
+                            "LEFT JOIN task_runs tr ON tr.id = t.current_run_id "
+                            "WHERE t.status = 'running'"):
+            if row["ts"]:
+                ages["build"].append(now - int(row["ts"]))
+        for row in _q(conn, "SELECT t.id, MAX(e.created_at) ts FROM tasks t "
+                            "JOIN task_events e ON e.task_id = t.id "
+                            "AND e.kind IN ('review_requested','review_reopened') "
+                            "WHERE t.status = 'review' GROUP BY t.id"):
+            ages["review"].append(now - int(row["ts"]))
+        # Only publication parks need an episode age: triage/ready/todo already
+        # carry their created_at above, and a `blocked` card is reported through
+        # the rails rather than on the main line.
+        for card in parked:
+            if card["status"] != "awaiting_publication":
+                continue
+            ages["publish"].append(now - (park_start.get(card["id"]) or card["created_at"]))
+
+    stages = []
+    for sid, label, column in _FLOW_STAGES:
+        count = wip.get(column, 0)
+        inflow = sum(n for (_, dst), n in edges.items() if dst == sid)
+        outflow = sum(n for (src, _), n in edges.items() if src == sid)
+        rate = outflow / days
+        wait = (count / (rate / 24.0)) if rate > 0 else None
+        dwell = ages.get(sid) or []
+        stages.append({
+            "id": sid, "label": label,
+            "wip": count,
+            "in": inflow, "out": outflow,
+            "out_per_day": round(rate, 2),
+            # inflow vs outflow is the whole bottleneck story: a stage whose
+            # arrivals exceed its departures is where the work is piling up.
+            "net_per_day": round((inflow - outflow) / days, 2),
+            "median_age_h": round(_flow_median(dwell) / 3600.0, 1) if dwell else None,
+            "oldest_age_h": round(max(dwell) / 3600.0, 1) if dwell else None,
+            "queue_hours": round(sum(dwell) / 3600.0, 1) if dwell else 0.0,
+            "wait_h": round(wait, 1) if wait is not None else None,
+            "flow": "unmeasured" if sid in _FLOW_UNMEASURED else "measured",
+            "terminal": sid == "done",
+        })
+    ranked = [s for s in stages if s["wip"] > 0 and not s["terminal"]]
+    constraint = max(ranked, key=lambda s: s["queue_hours"]) if ranked else None
+    if constraint:
+        constraint["constraint"] = True
+    return {
+        "stages": stages,
+        "rails": [{"id": key, "label": label, "wip": rail_wip.get(key, 0),
+                   "entered": rail_entered.get(key, 0)} for key, label in _FLOW_RAILS],
+        "publish_entered": publish_entered,
+        "churn": churn,
+        "done_total": done_total,
+        "edges": [{"from": a, "to": b, "count": n,
+                   "direction": "forward" if _FLOW_ORDER.get(a, 0) < _FLOW_ORDER.get(b, 0) else "rework"}
+                  for (a, b), n in sorted(edges.items(), key=lambda kv: -kv[1])],
+        "rework": sum(n for (a, b), n in edges.items() if _FLOW_ORDER.get(a, 0) > _FLOW_ORDER.get(b, 0)),
+        "cards_with_markers": len(markers),
+        "window_hours": window_hours,
+    }
+
+
+def _flow_entry(key: str, name: str, slug: str, board: Optional[dict[str, Any]],
+                path: Optional[str], window_hours: int, now: int,
+                archived: bool = False, unattached: bool = False) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "key": key, "name": name, "slug": slug, "board": slug, "path": path,
+        "archived": archived, "board_found": bool(board), "unattached": unattached,
+    }
+    if not board:
+        return entry
+    repo = _repo_from_path(path) or _repo_from_path(_board_workdir(slug))
+    entry["repo"] = repo
+    try:
+        entry.update(_flow_for_board(board["path"], window_hours, now))
+    except Exception as exc:                                        # noqa: BLE001
+        log.warning("flow: board %s failed", slug, exc_info=True)
+        entry["error"] = f"{type(exc).__name__}: {exc}"
+    return entry
+
+
+@router.get("/flow")
+def flow(window_hours: int = Query(168, ge=6, le=1440), project: Optional[str] = None):
+    """The living value-stream funnel: one row per project — kanban flow plus the
+    PR/CI/deploy leg — with the constraint named.
+
+    Occupancy and flow are read live from the boards; the code pipeline answers
+    from a cache (10 min) and refreshes on a background thread, so no request ever
+    waits on `gh`.
+    """
+    window_hours = int(window_hours)
+    now = _now()
+    boards = {b["slug"]: b for b in _boards()}
+    rows: list[dict[str, Any]] = []
+    claimed: set[str] = set()
+
+    for rec in _project_records():
+        key = rec["key"]
+        if project and project not in (key, rec["slug"], rec["name"]):
+            continue
+        slug = (rec["board"] or "").strip()
+        claimed.add(slug)
+        rows.append(_flow_entry(key, rec["name"], slug, boards.get(slug),
+                                rec["path"], window_hours, now, archived=rec["archived"]))
+
+    if not project:
+        for slug, board in boards.items():
+            if slug in claimed:
+                continue
+            entry = _flow_entry(f"board:{slug}", board["title"], slug, board,
+                                _board_workdir(slug), window_hours, now, unattached=True)
+            # An unattached board earns a row when it is carrying work; an empty
+            # one is noise, and the row's own `wip` sums already say "no load".
+            if not entry.get("cards_with_markers") and not any(
+                    s["wip"] for s in entry.get("stages", [])):
+                continue
+            rows.append(entry)
+
+    repos = sorted({r["repo"] for r in rows if r.get("repo")})
+    for repo in repos:
+        pipeline = _code_pipeline(repo)
+        for row in rows:
+            if row.get("repo") == repo:
+                row["pipeline"] = pipeline
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": window_hours,
+        "projects": rows,
+        "counts": {"projects": sum(1 for r in rows if not r.get("unattached")),
+                   "unattached_boards": sum(1 for r in rows if r.get("unattached"))},
+        "model": {
+            "occupancy": "snapshot of tasks.status right now",
+            "flow": f"per-card stage-marker events in the last {window_hours}h; an edge counts "
+                    "cards whose consecutive markers were those two stages",
+            "constraint": "highest queue-hours (summed dwell of the cards sitting in the stage)",
+            "wait_h": "Little's law: wip / measured exit rate; null where no exit event is instrumented",
+            "code_pipeline": f"gh reads, cached {int(_GH_TTL_SECONDS)}s, refreshed off the request path",
+        },
+    }
