@@ -1371,8 +1371,13 @@ function ProjectFlowCard({ project, initialOpen }) {
           : null
       ] })
       : (project.board_found ? jsx('div', { className: 'mc-dim', children: 'Nothing in flight on this board.' }) : null),
+    // The funnel is the page, so it renders collapsed too — just smaller. Every project therefore
+    // shows the same shape at a glance; expanding adds the detail (table, rails, rework, code leg)
+    // rather than being the thing that reveals the diagram at all.
+    jsx('div', { className: 'mc-flow', children: [
+      jsx(FlowPipe, { stages, edges: project.edges, height: open ? 200 : 120, ariaLabel: `${project.name} value stream` })
+    ] }),
     open ? jsxs('div', { className: 'mc-flow', children: [
-      jsx(FlowPipe, { stages, edges: project.edges, height: 200, ariaLabel: `${project.name} value stream` }),
       jsx(StageTable, { stages }),
       jsx(Section, { title: 'Parked work — the side rails', sub: 'what left the line, and why',
         children: jsx(RailStrip, { rails: project.rails }) }),
@@ -1438,6 +1443,8 @@ function FlowPage() {
         : jsx('div', { className: 'mc-dim', children: 'No stage is carrying a queue on any project right now.' })
     }),
 
+    jsx('div', { className: 'mc-dim', children: 'One funnel per project. Every project in the Projects list, plus any kanban board that has no project record — those are badged “board” so no work is invisible, and they behave the same way here.' }),
+
     jsxs('div', { className: 'mc-chips', children: [
       jsx('button', { className: 'mc-chip' + (only ? '' : ' mc-chip-on'), onClick: () => setOnly(null), children: 'every project' }),
       projects.map(p => jsx('button', {
@@ -1447,8 +1454,10 @@ function FlowPage() {
     ] }),
 
     shown.map(p => jsx(ProjectFlowCard, {
-      key: p.key, project: p, initialOpen: !p.unattached
-    }, p.key)),
+      key: p.key, project: p, initialOpen: !p.unattached || only === p.key
+      // The ':solo' key suffix forces a remount when you filter to one project, so the card opens;
+      // useState(initialOpen) only reads its argument on mount, and the key would otherwise be unchanged.
+    }, p.key + (only === p.key ? ':solo' : ''))),
 
     jsx(Section, {
       title: 'How to read this',
