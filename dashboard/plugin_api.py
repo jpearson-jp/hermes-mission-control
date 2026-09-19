@@ -1893,6 +1893,18 @@ _FLOW_RAILS = (
 # Stages whose exit event is genuinely instrumented. Backlog has no event that
 # says "left todo"; `done` is terminal.
 _FLOW_UNMEASURED = ("backlog", "done")
+# A DISPATCH IS NOT ALWAYS BUILD. `spawned`/`reclaimed` record that a run picked the card
+# up; when that run belongs to a review, audit or watch lane the card is being CHECKED,
+# not built, and counting it as "In build" manufactures the review->build arc out of the
+# reviewer's own pickup. Measured on the tos board, 7d: 12,847 spawns, of which
+# eng-reviewer 3,284 + eng-reviewer-2 1,504 + eng-auditor 655 are non-building lanes,
+# against 698 `changes_requested` — which is what real rework looks like.
+_FLOW_REVIEW_LANE_RE = re.compile(r"reviewer|auditor|watcher", re.I)
+_FLOW_DISPATCH_EVENTS = ("spawned", "reclaimed")
+# A rail counts cards that ARE parked, not cards that ever carried a block_kind: the core
+# preserves block_kind through the publication re-key and on archived cards, so a
+# block_kind-only predicate reads 1,848 where 1,131 cards are actually parked.
+_FLOW_PARKED_STATUSES = ("blocked", "triage", "awaiting_publication")
 
 _GH_TTL_SECONDS = 600.0
 _GH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -2161,30 +2173,42 @@ def _flow_for_board(db_path: str, window_hours: int, now: int) -> dict[str, Any]
                 done_total += 1
             elif status in columns:
                 wip[status] = wip.get(status, 0) + 1
-            if kind in rail_wip:
+            if kind in rail_wip and status in _FLOW_PARKED_STATUSES:
                 rail_wip[kind] += 1
-            if status in ("blocked", "triage", "awaiting_publication"):
+            if status in _FLOW_PARKED_STATUSES:
                 parked.append({"id": row["id"], "status": status, "bk": kind,
                                "created_at": int(row["created_at"] or 0)})
 
         # -- markers, park episodes, churn ------------------------------------
+        # The park-event kinds come from the ONE definition the queue readers use
+        # (`_park_kinds()` -> `owner_ask_filter.PARK_EVENT_KINDS`), never from a copy of
+        # the literal: a reader keyed on `blocked` alone sees about a tenth of the parks.
+        park_kinds = set(_park_kinds())
         markers: dict[str, list[tuple[int, str]]] = {}
         park_start: dict[str, int] = {}
         last_park: dict[str, tuple[str, str]] = {}   # task -> (block kind, source_status)
         rail_entered = {key: 0 for key, _ in _FLOW_RAILS}
         publish_entered = 0
         churn = 0
-        for row in _q(conn, "SELECT task_id, kind, payload, created_at FROM task_events "
-                            "WHERE kind != 'heartbeat' ORDER BY task_id, id"):
+        # `run_profile` carries the lane that recorded the event, which is what makes a
+        # dispatch attributable (see _FLOW_REVIEW_LANE_RE).
+        for row in _q(conn, "SELECT e.task_id, e.kind, e.payload, e.created_at, "
+                            "COALESCE(r.profile,'') AS run_profile FROM task_events e "
+                            "LEFT JOIN task_runs r ON r.id = e.run_id "
+                            "WHERE e.kind != 'heartbeat' ORDER BY e.task_id, e.id"):
             kind, tid, ts = row["kind"], row["task_id"], int(row["created_at"])
-            if kind == "blocked":
+            if kind in park_kinds:
                 fields = _flow_payload_fields(row["payload"])
-                payload_kind = fields.get("kind")
-                last_park[tid] = (str(payload_kind or ""), str(fields.get("source_status") or ""))
+                # `blocked` and `block_loop_detected` name the park in `kind`;
+                # `block_retyped` names the NEW park in `to` — it is a move from one park
+                # to another, and that move IS the entry into the new lane.
+                park_kind = str((fields.get("to") if kind == "block_retyped"
+                                 else fields.get("kind")) or "")
+                last_park[tid] = (park_kind, str(fields.get("source_status") or ""))
                 if ts >= since:
-                    if payload_kind in rail_entered:
-                        rail_entered[payload_kind] += 1
-                    if payload_kind == "awaiting_publication":
+                    if park_kind in rail_entered:
+                        rail_entered[park_kind] += 1
+                    if park_kind == "awaiting_publication":
                         publish_entered += 1
                         markers.setdefault(tid, []).append((ts, "publish"))
                 # Episode start: the FIRST block since the last act that left a
@@ -2216,7 +2240,13 @@ def _flow_for_board(db_path: str, window_hours: int, now: int) -> dict[str, Any]
                 continue
             if ts >= since and kind in _FLOW_CHURN_EVENTS:
                 churn += 1
-            stage = _FLOW_MARKERS.get(kind)
+            # A dispatch by a review/audit/watch lane is the card being CHECKED, not built:
+            # attribute it to the lane that ran, or the reviewer's own pickup is counted as
+            # work entering "In build" and the review->build arc becomes an artifact.
+            if kind in _FLOW_DISPATCH_EVENTS:
+                stage = "review" if _FLOW_REVIEW_LANE_RE.search(row["run_profile"] or "") else "build"
+            else:
+                stage = _FLOW_MARKERS.get(kind)
             if stage and ts >= since:
                 markers.setdefault(tid, []).append((ts, stage))
 
@@ -2365,9 +2395,21 @@ def flow(window_hours: int = Query(168, ge=6, le=1440), project: Optional[str] =
         "model": {
             "occupancy": "snapshot of tasks.status right now",
             "flow": f"per-card stage-marker events in the last {window_hours}h; an edge counts "
-                    "cards whose consecutive markers were those two stages",
+                    "TRANSITIONS (a card whose consecutive markers were those two stages "
+                    "contributes one per occurrence, so a card that cycles contributes more "
+                    "than once)",
             "constraint": "highest queue-hours (summed dwell of the cards sitting in the stage)",
             "wait_h": "Little's law: wip / measured exit rate; null where no exit event is instrumented",
+            "parks": "read over every park-event kind the queue readers use "
+                     "(blocked, block_retyped, block_loop_detected), never `blocked` alone — a "
+                     "reader keyed on `blocked` sees about a tenth of the parks",
+            "dispatch": "a spawned/reclaimed event is attributed to the lane that ran it "
+                        "(task_runs.profile): a review/audit/watch lane reads as In review, "
+                        "anything else as In build",
+            "rails": "cards PARKED right now (blocked/triage/awaiting_publication) — a "
+                     "block_kind left on an archived or published card is not a rail",
+            "rework": "markers that run backwards through the stage order; counted from the "
+                      "same markers, so it is only as good as the attribution above",
             "code_pipeline": f"gh reads, cached {int(_GH_TTL_SECONDS)}s, refreshed off the request path",
         },
     }

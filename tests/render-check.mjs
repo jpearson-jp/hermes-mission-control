@@ -102,6 +102,24 @@ walk(tree)
 const text = flat.join(' | ')
 const json = JSON.stringify(tree)
 
+// Bands are collected as ELEMENTS, never as key strings. A band's stage id lives only in its
+// key, and `json`/`flat` keep those strings even when the band never reached the tree — which
+// is exactly what `jsx(type, props, children)` does when children lands in `key`. This is the
+// assertion that has to be able to fail on that bug.
+const bandKeys = node => {
+  const found = []
+  const run = n => {
+    if (n == null || n === false) return
+    if (Array.isArray(n)) return n.forEach(run)
+    if (typeof n !== 'object') return
+    const cls = n.props && n.props.className
+    if (typeof cls === 'string' && cls.startsWith('mc-flow-band')) found.push(n.key)
+    if (n.props && n.props.children) run(n.props.children)
+  }
+  run(node)
+  return found
+}
+
 // ---- 2. no NaN / undefined leaks into text or geometry --------------------
 ok(!/NaN/.test(json), 'NaN appeared in the rendered tree')
 ok(!/\bundefined\b/.test(text), 'the literal "undefined" reached rendered text')
@@ -111,7 +129,7 @@ ok(!/\bnull\b/.test(text), 'the literal "null" reached rendered text')
 ok(text.includes('Where the work is stuck'), 'the constraint panel is missing')
 ok(text.includes('CONSTRAINT'), 'no CONSTRAINT label rendered')
 ok(text.includes('How to read this'), 'the legend is missing')
-ok(text.includes('mc-flow-band'), 'no flow bands rendered')
+ok(bandKeys(tree).length > 0, 'no flow bands rendered (as elements)')
 ok(text.includes('rework'), 'no rework information rendered')
 
 // ---- 4. geometry is finite ------------------------------------------------
@@ -120,11 +138,22 @@ ok(nums.length > 0, 'no svg geometry found at all')
 const bad = nums.filter(v => /NaN|undefined|Infinity/.test(v))
 ok(bad.length === 0, 'non-finite svg geometry: ' + bad.slice(0, 3).join(' ; '))
 
-// ---- 5. every non-terminal stage in the payload got a band ---------------
+// ---- 5. every non-terminal stage in the payload got a band ELEMENT ---------
 const first = PAYLOAD.projects.find(p => p.board_found && (p.stages || []).length)
 if (first) {
+  const want = first.stages.filter(x => !x.terminal).length
+  const bands = bandKeys(tree)
+  ok(bands.length >= want, `only ${bands.length} band ELEMENTS for ${want} non-terminal stages`)
   for (const s of first.stages.filter(x => !x.terminal)) {
-    ok(json.includes(`band-${s.id}`), `no band drawn for stage ${s.id}`)
+    ok(bands.includes(`band-${s.id}`), `no band ELEMENT reached the tree for stage ${s.id}`)
+  }
+  // ---- 5b. a COLLAPSED project card still draws its funnel -----------------
+  // The funnel is the page: it must not be something only expanding reveals. A card that
+  // is collapsed renders the same diagram at a smaller height.
+  if (P.ProjectFlowCard) {
+    const closed = bandKeys(P.ProjectFlowCard({ project: first, initialOpen: false }))
+    ok(closed.length >= want,
+      `a COLLAPSED project card drew ${closed.length} bands, not ${want} — the funnel is hidden until you expand`)
   }
 }
 
