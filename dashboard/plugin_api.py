@@ -2336,3 +2336,102 @@ def flow(window_hours: int = Query(168, ge=6, le=1440), project: Optional[str] =
             "code_pipeline": f"gh reads, cached {int(_GH_TTL_SECONDS)}s, refreshed off the request path",
         },
     }
+
+
+# --- the scheduler page's ONE source of numbers ---------------------------------
+#
+# ⛔ ONE IMPLEMENTATION, TWO CONSUMERS. `~/.hermes/scripts/lib/scheduler_telemetry.py` is the
+# measurement; the cron watcher (`hermes-scheduler-telemetry.py`) escalates from it and this route
+# renders it. The route does NOT re-derive a share or a wait here: two implementations of the same
+# predicate is two contracts, and they drift (the store's own doctrine -- see `lib/owner_ask_filter`,
+# `lib/finding_delivery`). The module is resolved by PATH the same way `_ask_filter()` resolves
+# `owner_ask_filter`, because a per-profile dashboard backend would otherwise look for
+# `<profile home>/scripts/lib` and find nothing.
+_SCHED_TELE = None
+
+
+def _sched_telemetry():
+    """The measurement module, or None when it cannot be imported (reported, never guessed)."""
+    global _SCHED_TELE
+    if _SCHED_TELE is None:
+        for lib_dir in _scripts_lib_dirs():
+            try:
+                if str(lib_dir) not in sys.path:
+                    sys.path.insert(0, str(lib_dir))
+                import scheduler_telemetry  # noqa: PLC0415
+                _SCHED_TELE = scheduler_telemetry
+                log.info("scheduler telemetry loaded from %s", lib_dir)
+                break
+            except Exception:
+                continue
+        if _SCHED_TELE is None:
+            log.warning("scheduler_telemetry could not be imported; /scheduler will report that "
+                        "rather than render numbers")
+            _SCHED_TELE = False
+    return _SCHED_TELE or None
+
+
+@router.get("/scheduler")
+def scheduler(window_minutes: int = Query(60, ge=5, le=1440),
+              starve_minutes: int = Query(45, ge=5, le=1440)):
+    """Per-board share, wait-time distribution and starvation, measured LIVE on every request.
+
+    Live on purpose: a page that renders a cron-written state file shows yesterday's estate the
+    moment the job stops, and the failure is silent. The watcher's own record is returned beside the
+    reading (last run, last change, filings) so the page can show the ALERTING half's liveness --
+    it is never the source of a number.
+
+    An unreadable board, an unimportable module or an unreadable config are REPORTED here: the
+    payload carries `unreadable` / `error` and the page renders them. "Could not measure" must never
+    render as a zero.
+    """
+    window_minutes = _int_or_none(window_minutes) or 60
+    starve_minutes = _int_or_none(starve_minutes) or 45
+    now_iso = datetime.now(timezone.utc).isoformat()
+    mod = _sched_telemetry()
+    if mod is None:
+        return {
+            "error": "the measurement module (scripts/lib/scheduler_telemetry.py) could not be "
+                     "imported, so NOTHING is measured. This page does not guess: no share, no "
+                     "wait distribution and no starvation state can be rendered from here.",
+            "generated_at_iso": now_iso,
+            "boards": [], "alerts": [], "unreadable": [], "strays": [], "totals": {},
+        }
+    try:
+        root = mod.hermes_root()
+        payload = mod.snapshot(root, window_seconds=window_minutes * 60,
+                               starve_seconds=starve_minutes * 60)
+    except Exception as exc:  # noqa: BLE001 -- a route must answer, and must say why it could not
+        log.exception("scheduler telemetry read failed")
+        return {"error": "the telemetry read failed: %s: %s" % (type(exc).__name__, exc),
+                "generated_at_iso": now_iso, "boards": [], "alerts": [], "unreadable": [],
+                "strays": [], "totals": {}}
+
+    payload["generated_at_iso"] = datetime.fromtimestamp(
+        payload.get("generated_at") or time.time(), timezone.utc).isoformat()
+    payload["root"] = str(root)
+    payload["watcher"] = _sched_watcher_state(root, payload.get("generated_at"))
+    return payload
+
+
+def _sched_watcher_state(root: Path, now: Optional[int]) -> dict[str, Any]:
+    """What the cron watcher recorded on its last run -- READ ONLY, and never a number's source."""
+    path = root / "state" / "scheduler-telemetry.json"
+    out: dict[str, Any] = {"state_path": str(path), "read": False,
+                           "last_run_at": None, "last_changed_at": None,
+                           "stale_seconds": None, "filings": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        out["why"] = "the watcher's state file could not be read (%s) -- the ALERTING half has " \
+                     "not run, or has never written it" % type(exc).__name__
+        return out
+    out["read"] = True
+    out["last_run_at"] = _iso(data.get("last_run_at"))
+    out["last_changed_at"] = _iso(data.get("last_changed_at"))
+    last = _int_or_none(data.get("last_run_at"))
+    if last and now:
+        out["stale_seconds"] = max(0, int(now) - last)
+    elif last:
+        out["stale_seconds"] = max(0, int(time.time()) - last)
+    return out

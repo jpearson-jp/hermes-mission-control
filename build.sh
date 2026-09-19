@@ -17,7 +17,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGINS_DIR="$(dirname "$HERE")"
-PAGES="mission-control:overview mission-control-waiting:waiting mission-control-insights:insights"
+PAGES="mission-control:overview mission-control-waiting:waiting mission-control-insights:insights mission-control-scheduler:scheduler"
 
 build_one() {
   local name="$1" page="$2"
@@ -34,6 +34,9 @@ build_one() {
     insights) label="Insights";       icon="BarChart3"; path="/insights";      position="after:waiting-on-me"
               tpl="manifest.json"
               desc="The estate at a glance: throughput, what state every card is in, what is stuck and for how long, who is working, what is failing, schedule health — and how the ask pipeline performs: asks filed per lane, how many came back, how long each waited, and how many the owner answered himself." ;;
+    scheduler) label="Scheduler";     icon="Gauge";     path="/scheduler";     position="after:insights"
+              tpl="manifest.json"
+              desc="What the ONE cross-campaign ranking actually did: each board's share of the tick budget spent, the wait-time distribution of takeable cards (chosen and still waiting), and the starvation state of every board — measured live by the same module the starvation alert escalates from." ;;
   esac
 
   mkdir -p "$dir/dashboard/dist"
