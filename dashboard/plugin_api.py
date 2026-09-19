@@ -1905,6 +1905,18 @@ _FLOW_DISPATCH_EVENTS = ("spawned", "reclaimed")
 # preserves block_kind through the publication re-key and on archived cards, so a
 # block_kind-only predicate reads 1,848 where 1,131 cards are actually parked.
 _FLOW_PARKED_STATUSES = ("blocked", "triage", "awaiting_publication")
+# A RAIL COUNTS CARDS WHOSE CURRENT STATE IS THAT PARK. `block_kind` is STICKY — the core
+# preserves it through the publication re-key and after a card moves on (measured on tos:
+# capability carries 349 cards in `review` and 354 archived; needs_input carries 263 in
+# `awaiting_publication`) — so the STATUS is the discriminator and each rail has its own shape:
+#   * needs_input / capability / transient leave the card in a parked status (blocked, triage);
+#   * a dependency park does NOT. The core sends kind='dependency' to `todo` and auto-resumes it,
+#     so a parked-status predicate reads the Dependency rail as a STRUCTURAL ZERO (measured:
+#     block_kind='dependency' by status is todo 98 / archived 20 / running 3).
+#   * `awaiting_publication` and `review` are live lanes on the funnel, not rails; a preserved
+#     block_kind there is stale, which is why they are NOT in the default shape.
+_FLOW_RAIL_STATUSES = {"dependency": ("todo",)}
+_FLOW_RAIL_DEFAULT_STATUSES = ("blocked", "triage")
 
 _GH_TTL_SECONDS = 600.0
 _GH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -2173,7 +2185,7 @@ def _flow_for_board(db_path: str, window_hours: int, now: int) -> dict[str, Any]
                 done_total += 1
             elif status in columns:
                 wip[status] = wip.get(status, 0) + 1
-            if kind in rail_wip and status in _FLOW_PARKED_STATUSES:
+            if kind in rail_wip and status in _FLOW_RAIL_STATUSES.get(kind, _FLOW_RAIL_DEFAULT_STATUSES):
                 rail_wip[kind] += 1
             if status in _FLOW_PARKED_STATUSES:
                 parked.append({"id": row["id"], "status": status, "bk": kind,
@@ -2406,8 +2418,11 @@ def flow(window_hours: int = Query(168, ge=6, le=1440), project: Optional[str] =
             "dispatch": "a spawned/reclaimed event is attributed to the lane that ran it "
                         "(task_runs.profile): a review/audit/watch lane reads as In review, "
                         "anything else as In build",
-            "rails": "cards PARKED right now (blocked/triage/awaiting_publication) — a "
-                     "block_kind left on an archived or published card is not a rail",
+            "rails": "cards whose CURRENT state is that park: blocked/triage for "
+                     "needs_input, capability and transient, and status=todo for dependency "
+                     "(a dependency park auto-resumes from todo, so a parked-status predicate "
+                     "reads that rail as a structural zero). block_kind is sticky — a preserved "
+                     "one on an archived, published or reviewed card is not a rail",
             "rework": "markers that run backwards through the stage order; counted from the "
                       "same markers, so it is only as good as the attribution above",
             "code_pipeline": f"gh reads, cached {int(_GH_TTL_SECONDS)}s, refreshed off the request path",
