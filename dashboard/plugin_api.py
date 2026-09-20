@@ -795,7 +795,10 @@ def card(board: str, task_id: str = Query(..., alias="id")):
             SELECT t.id, t.title, t.status FROM tasks t JOIN task_links l ON l.child_id = t.id
              WHERE l.parent_id = ?
         """, (task_id,))
-    ask = _reason_from_payload(next((e["payload"] for e in events if e["kind"] == "blocked"), None))
+    # The ask is the NEWEST PARK EVENT, over the same triple every other park reader in this file
+    # uses: a `blocked`-only read shows NO ask for a card that was re-typed or loop-broken into
+    # its park, which is how most cards enter one.
+    ask = _reason_from_payload(next((e["payload"] for e in events if e["kind"] in _park_kinds()), None))
     frame_body = next((c["body"] for c in comments if c["body"] and _FRAME_MARKER in c["body"]), None)
     frame = parse_frame(frame_body)
     bt = b["title"]
@@ -1513,9 +1516,25 @@ def attention(days: int = Query(7, ge=1, le=90)):
         with closing(_ro(b["path"])) as conn:
             owners = {r["id"]: r["assignee"] for r in _q(conn, "SELECT id, assignee FROM tasks")}
             blocks: dict[str, int] = {}
-            for r in _q(conn, "SELECT task_id, created_at FROM task_events "
-                              "WHERE kind='blocked' AND payload LIKE '%needs_input%' AND created_at >= ? "
-                              "ORDER BY created_at", (since,)):
+            # PARK READS USE THE TRIPLE AND THE JSON FIELD, never `kind='blocked'` and never a
+            # substring match over prose. The old predicate here was BOTH:
+            #   `kind='blocked' AND payload LIKE '%needs_input%'`
+            # — too narrow, because a card re-typed or loop-broken into needs_input is recorded as
+            # `block_retyped` / `block_loop_detected` and never as `blocked`; and too broad,
+            # because a `blocked` park of ANOTHER kind whose reason text happens to discuss
+            # needs_input matched the LIKE. Measured across every board, 7d: 2,269 asks by the old
+            # predicate against 2,322 over the triple, and the difference is not a wash — board
+            # `default` counted 87 with 2 of them phantom, and sanctuary missed 1.
+            park_sql = ",".join("'%s'" % k for k in _park_kinds())
+            for r in _q(conn, f"SELECT task_id, kind, payload, created_at FROM task_events "
+                              f"WHERE kind IN ({park_sql}) AND created_at >= ? "
+                              f"ORDER BY created_at", (since,)):
+                fields = _flow_payload_fields(r["payload"])
+                # `blocked` / `block_loop_detected` name the park in `kind`; `block_retyped` names
+                # the NEW park in `to`.
+                k = fields.get("to") if r["kind"] == "block_retyped" else fields.get("kind")
+                if str(k or "") != "needs_input":
+                    continue
                 ts = _int_or_none(r["created_at"])
                 if ts:
                     blocks[r["task_id"]] = ts
