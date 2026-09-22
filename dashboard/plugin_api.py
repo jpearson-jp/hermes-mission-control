@@ -10,10 +10,15 @@ same code path the CLI and the bundled kanban plugin use, so the surfaces cannot
     POST /comment  comment on a card as the owner, no state change
     POST /assign   give an ownerless card a real lane (``assign_task``, so the event is recorded)
 
-The "waiting on you" list uses the SAME framing contract as ``hermes-decision-nag.py``: a
-comment containing ``## OPTIONS FOR THE OWNER``, 2-4 contiguous numbered options, and a
-``**RECOMMENDATION: N**`` line. A card is pickable here exactly when the nag can send it,
-so the dashboard and the nagger never disagree about what is a real owner ask.
+The "waiting on you" list uses the SAME framing contract as ``hermes-decision-nag.py``, and since
+2026-09-22 it uses that contract's own PARSER (``<hermes home>/scripts/lib/owner_options.py``): a
+``## OPTIONS FOR THE OWNER`` HEADING on a line of its own, 2-4 contiguous numbered options under
+it, and an optional ``**RECOMMENDATION: N**`` line. A card is pickable here exactly when the nag can
+send it, so the dashboard and the nagger never disagree about what is a real owner ask -- a claim
+this header made while it was FALSE: the page selected the NEWEST comment CONTAINING the phrase, so
+a status note that merely mentioned the heading in prose un-framed a live owner ask. MEASURED
+2026-09-22: nine parked owner asks rendered with no options at all while the block sat on the card
+(kanban t_c8674e51).
 """
 
 from __future__ import annotations
@@ -43,6 +48,10 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 _FRAME_MARKER = "OPTIONS FOR THE OWNER"
+# The mark as a HEADING ON A LINE OF ITS OWN -- the shape `lib/owner_options.MARK_RE` anchors and
+# the shape the framer writes. A mention of the phrase inside a sentence is NOT a block, and
+# reading one as a block is what un-framed nine live owner asks (kanban t_c8674e51).
+_FRAME_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*OPTIONS FOR THE OWNER[ \t]*$", re.M | re.I)
 _REC_RE = re.compile(r"\*\*RECOMMENDATION:\s*(\d+)\*\*")
 _OPT_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
 _HUMAN_HINT_RE = re.compile(r"\bjesse\b|\bowner\b|\byour call\b|\bneeds your\b", re.I)
@@ -51,6 +60,10 @@ _HUMAN_HINT_RE = re.compile(r"\bjesse\b|\bowner\b|\byour call\b|\bneeds your\b",
 # the imported module, or False once we have looked and failed. Never a bare None check --
 # False means "looked and could not", which must not be re-attempted per request.
 _ASK_FILTER = None
+
+# The ONE owner-options parser (`<hermes home>/scripts/lib/owner_options.py`), resolved lazily by
+# `_owner_options()` the same way: the imported module, or False once we have looked and failed.
+_OWNER_OPTIONS = None
 
 OPTION_PREVIEW_CHARS = 260
 ASK_PREVIEW_CHARS = 700
@@ -193,16 +206,83 @@ def _reason_from_payload(payload: Optional[str]) -> Optional[str]:
 
 
 def parse_frame(text: Optional[str]) -> dict[str, Any]:
-    """Mirror ``hermes-decision-nag.py``'s framing parser.
+    """The owner ask ``text`` carries, in this page's shape -- the ONE parser's verdict.
 
-    Contiguous numbered options starting at 1 (2-4 of them) after the marker, plus an
-    optional ``**RECOMMENDATION: N**``. Anything else is not a framed owner ask.
+    ⛔ THE MARK IS A HEADING ON A LINE OF ITS OWN, NOT A SUBSTRING (kanban t_c8674e51).
+    MEASURED 2026-09-22 on the live board: this function used to slice from the FIRST occurrence
+    of the phrase anywhere in the body, so a status note that merely MENTIONED
+    ``## OPTIONS FOR THE OWNER`` in prose was read as the ask and the next numbered list inside it
+    became the owner's options. Nine parked owner asks rendered with no options at all while a real
+    block sat on the card (t_b56d0255, t_b30b0a52 and seven more), because `_frame_bodies` takes the
+    newest candidate and the newest candidate was the mention.
+
+    The verdict is `lib/owner_options.parse` -- the same function `hermes-decision-nag.py` sends
+    from and `decision-framer-facts.py` counts with -- so the page and the nagger cannot disagree
+    about what is a real owner ask, which is what this module's header promises. `None` from it is
+    a REFUSAL (a mention, a quotation, a numbering gap, one option, five) and is returned as
+    framed=False; it is never re-judged locally.
+
+    The local parse runs ONLY when the scripts store cannot be imported, and it is
+    heading-anchored too: a broken import degrades to a read, never to the substring bug this
+    replaces.
     """
     out: dict[str, Any] = {"framed": False, "options": [], "recommendation": None,
                            "summary": None, "raw": None}
-    if not text or _FRAME_MARKER not in text:
+    if not text:
         return out
-    tail = text.split(_FRAME_MARKER, 1)[1]
+    mod = _owner_options()
+    if mod is not None:
+        try:
+            parsed = mod.parse(text)
+        except Exception:  # a parser that raises must not take the page down with it
+            log.warning("owner_options.parse raised; falling back to the local "
+                        "heading-anchored parse", exc_info=True)
+        else:
+            return _frame_from_parsed(out, text, parsed)
+    return _frame_local(out, text)
+
+
+def _frame_from_parsed(out: dict[str, Any], text: str,
+                       parsed: Optional[dict]) -> dict[str, Any]:
+    """This page's shape, from `lib/owner_options.parse`'s verdict (``None`` == refused)."""
+    if parsed is None:
+        return out
+    options = [t for _num, t in parsed["options"]]
+    rec = _int_or_none(parsed.get("recommend"))
+    head = _last_frame_heading(text)
+    out.update({
+        "framed": True,
+        "options": [t[:OPTION_PREVIEW_CHARS] for t in options],
+        "recommendation": rec if rec and 1 <= rec <= len(options) else None,
+        "summary": (parsed.get("summary") or "")[:ASK_PREVIEW_CHARS] or None,
+        "raw": (text[head.end():].strip()[:4000] if head else ""),
+    })
+    return out
+
+
+def _last_frame_heading(text: str):
+    """The LAST real ``## OPTIONS FOR THE OWNER`` heading in ``text``, or None.
+
+    Last wins for the same reason `lib/owner_options.parse` takes the last: a re-framed block
+    later in the same comment supersedes the one above it.
+    """
+    found = None
+    for m in _FRAME_HEADING_RE.finditer(text):
+        found = m
+    return found
+
+
+def _frame_local(out: dict[str, Any], text: str) -> dict[str, Any]:
+    """The fallback parse -- heading-anchored, never a substring slice.
+
+    Reached only when `lib/owner_options.py` cannot be imported. A page that silently hid every
+    ask would be the worse failure, so it keeps reading; it anchors on the heading, so it cannot
+    resurrect the prose-mention defect it replaces.
+    """
+    head = _last_frame_heading(text)
+    if head is None:
+        return out
+    tail = text[head.end():]
     numbers: list[int] = []
     texts: list[str] = []
     for line in tail.splitlines():
@@ -307,20 +387,50 @@ def _chunks(seq: list, size: int = 400):
         yield seq[i:i + size]
 
 
+def _newest_framed_body(bodies: list[str]) -> Optional[str]:
+    """The NEWEST body carrying a real options block -- a prose MENTION is not a candidate.
+
+    ⛔ NOT "the newest body containing the phrase" (kanban t_c8674e51). That rule let a status
+    note which mentions ``## OPTIONS FOR THE OWNER`` in prose shadow the block below it, and the
+    owner's list then showed him an ask with zero options while the block sat on the card. A body
+    the parser REFUSES does not shadow an older good one -- `lib/owner_options.newest`'s contract,
+    and the reason `hermes-decision-nag.py` was right all along on the two cards that exposed this.
+
+    ``bodies`` must be NEWEST FIRST. ONE predicate with the renderer (`parse_frame`), so the body
+    this picks is exactly the body the page then renders.
+    """
+    for body in bodies:
+        if body and parse_frame(body)["framed"]:
+            return body
+    return None
+
+
 def _frame_bodies(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
-    """Newest framed-ask comment per task, for EVERY parked card — not just the newest few.
+    """Newest FRAMED-ASK comment per task, for EVERY parked card — not just the newest few.
 
     Owner asks are not recency-ordered: the nag keeps asking a card parked three days ago, and a
     windowed fetch silently reports "nothing for you" while the ask exists. Batched IN() keeps this
     to a couple of queries even with a few hundred parks.
+
+    ⛔ THE LIKE IS A CANDIDATE FILTER; THE VERDICT IS THE PARSER (kanban t_c8674e51). The LIKE
+    cannot be the verdict, because a body that merely MENTIONS the heading contains the phrase too
+    (276 such comments on the live board). So the rows come back NEWEST FIRST and the first body per
+    task that `parse_frame` actually frames wins: a mention, or a block the parser refuses, cannot
+    shadow an older good one -- `lib/owner_options.newest`'s contract, and what the nag has always
+    done. The LIKE stays because it is a cheap SUPERSET of any body a heading could be in.
     """
     out: dict[str, str] = {}
     for chunk in _chunks(ids):
         marks = ",".join("?" * len(chunk))
         for row in conn.execute(
             f"SELECT task_id, body FROM task_comments "
-            f"WHERE task_id IN ({marks}) AND body LIKE '%OPTIONS FOR THE OWNER%' ORDER BY id", chunk):
-            out[row["task_id"]] = row["body"]  # last wins == newest
+            f"WHERE task_id IN ({marks}) AND body LIKE '%OPTIONS FOR THE OWNER%' "
+            f"ORDER BY id DESC", chunk):
+            tid = row["task_id"]
+            if tid in out:
+                continue                       # a NEWER comment already framed this task
+            if row["body"] and parse_frame(row["body"])["framed"]:
+                out[tid] = row["body"]
     return out
 
 
@@ -455,6 +565,41 @@ def _scripts_lib_dirs() -> list[Path]:
     add(Path.home() / ".hermes")
     add(_hermes_home())
     return out
+
+
+def _owner_options():
+    """The ONE owner-options parser, imported from the scripts store by IDENTITY.
+
+    ⛔ ONE IMPLEMENTATION, FOUR CONSUMERS. `hermes-decision-nag.py` (what gets SENT),
+    `decision-framer-facts.py` (what counts as ALREADY FRAMED) and `engwatch-card-hygiene.py`
+    (what a RECREATE must carry over) all import `<hermes home>/scripts/lib/owner_options.py`,
+    whose own docstring says a mirror drifts. This page held the fourth copy of the rule and it
+    DID drift: it read the mark as a SUBSTRING while the others anchor it as a HEADING, so nine
+    live owner asks rendered with no options at all (kanban t_c8674e51). The page now reads the
+    same file, so "the dashboard and the nagger never disagree about what is a real owner ask"
+    is true by construction rather than by intent.
+
+    Returns None when the module cannot be imported; `parse_frame` then uses its own
+    heading-anchored parse, which is the same rule and cannot resurrect the substring bug. The
+    warning is logged once.
+    """
+    global _OWNER_OPTIONS
+    if _OWNER_OPTIONS is None:
+        for lib_dir in _scripts_lib_dirs():
+            try:
+                if str(lib_dir) not in sys.path:
+                    sys.path.insert(0, str(lib_dir))
+                import owner_options  # noqa: PLC0415
+                _OWNER_OPTIONS = owner_options
+                log.info("owner-options parser loaded from %s", lib_dir)
+                break
+            except Exception:
+                continue
+        if _OWNER_OPTIONS is None:
+            log.warning("owner_options could not be imported; the frame reader falls back to its "
+                        "own heading-anchored parse (same rule, unshared implementation)")
+            _OWNER_OPTIONS = False
+    return _OWNER_OPTIONS or None
 
 
 _PARK_KINDS_FALLBACK = ("blocked", "block_retyped", "block_loop_detected")
@@ -659,11 +804,13 @@ def _board_summary(slug: str, db: str, pulse_from: int) -> dict[str, Any]:
             SELECT (created_at/3600)*3600 AS bucket, COUNT(*) c FROM task_events
              WHERE created_at >= ? GROUP BY bucket ORDER BY bucket
         """, (pulse_from,))
-        needs_framed = _q1(conn, """
-            SELECT COUNT(DISTINCT t.id) c FROM tasks t JOIN task_comments c ON c.task_id = t.id
-             WHERE t.block_kind='needs_input' AND t.status IN ('blocked','triage')
-               AND c.body LIKE '%OPTIONS FOR THE OWNER%'
-        """)
+        # ⛔ THE COUNT IS THE READER'S VERDICT, NOT A LIKE (kanban t_c8674e51): counting
+        # comments that MENTION the heading made a prose mention look like a framed ask, so this
+        # number disagreed with the list it summarises. Same helper as the list, so it cannot.
+        needs_framed = len(_frame_bodies(conn, [r["id"] for r in _q(conn, """
+            SELECT id FROM tasks
+             WHERE block_kind='needs_input' AND status IN ('blocked','triage')
+        """)]))
         boards_row = _q1(conn, "SELECT COUNT(*) c FROM tasks WHERE block_kind='capability' AND status='blocked'")
     in_flight = []
     now = _now()
@@ -698,7 +845,7 @@ def _board_summary(slug: str, db: str, pulse_from: int) -> dict[str, Any]:
         } for r in recent_done],
         "pulse": [{"bucket": _iso(r["bucket"]), "count": r["c"]} for r in pulse],
         "needs_input": int((counts.get("blocked", 0) + counts.get("triage", 0))),
-        "needs_input_framed": int(needs_framed["c"] if needs_framed else 0),
+        "needs_input_framed": int(needs_framed),
         "blocked_capability": int(boards_row["c"] if boards_row else 0),
     }
 
@@ -795,11 +942,15 @@ def card(board: str, task_id: str = Query(..., alias="id")):
             SELECT t.id, t.title, t.status FROM tasks t JOIN task_links l ON l.child_id = t.id
              WHERE l.parent_id = ?
         """, (task_id,))
+        # ⛔ THE SAME SELECTION THE LIST USES (kanban t_c8674e51): `_frame_bodies`, not "the
+        # newest of the 25 comments this page happens to render containing the phrase". The detail
+        # page and the list must not pick different bodies -- and the 25-comment window meant a
+        # block older than 25 comments was invisible here while the list still showed it.
+        frame_body = _frame_bodies(conn, [task_id]).get(task_id)
     # The ask is the NEWEST PARK EVENT, over the same triple every other park reader in this file
     # uses: a `blocked`-only read shows NO ask for a card that was re-typed or loop-broken into
     # its park, which is how most cards enter one.
     ask = _reason_from_payload(next((e["payload"] for e in events if e["kind"] in _park_kinds()), None))
-    frame_body = next((c["body"] for c in comments if c["body"] and _FRAME_MARKER in c["body"]), None)
     frame = parse_frame(frame_body)
     bt = b["title"]
     age = _now() - (_int_or_none(t["created_at"]) or _now())
