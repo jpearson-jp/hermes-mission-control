@@ -143,9 +143,10 @@ def fixture():
               Its only `blocked` event is 5 d old, so a `blocked`-only window read loses it
               and a `blocked`-only age read measures the park it left.
     t_loop    parked `needs_input` 3 d ago, then LOOP-BROKEN 5 min ago.
-    t_loop_nk the same, with the live shape of a loop-breaker payload — `reason` only, NO
-              `kind` field (measured on the tos board) — so the arm also pins that the
-              readers take the park KIND from the row, not from the payload.
+    t_loop_nk the same, with a loop-breaker payload carrying NO `kind` (an edge: MEASURED on
+              the live tos board, 2 of 698 `block_loop_detected` payloads have none) — so the
+              arm also pins that the readers take the park KIND from the ROW and cannot be
+              broken by a payload without one.
     t_ctl     parked `needs_input` once, 4 d ago: the cards that already agreed.
     """
     cards = [
@@ -308,8 +309,9 @@ class ParkReaderShapeTest(unittest.TestCase):
         looped = api._flow_payload_fields(newest["t_loop"]["payload"])
         self.assertEqual(looped.get("kind"), "needs_input")
 
-    def test_the_loop_breaker_s_live_payload_has_no_kind_and_still_reads(self):
-        """MEASURED on the tos board: `block_loop_detected` carries `reason` only."""
+    def test_a_loop_breaker_payload_without_a_kind_still_reads(self):
+        """An edge, MEASURED: 2 of the live board's 698 `block_loop_detected` payloads carry
+        no `kind`. The readers take the park KIND from the ROW, so neither can be broken."""
         conn = self.board.conn()
         newest = api._newest_park_events(conn, ["t_loop_nk"])
         conn.close()
@@ -402,6 +404,22 @@ class LiveBoardTest(unittest.TestCase):
                 wrong.append((row["id"], row["age_seconds"], NOW - newest))
         conn.close()
         self.assertEqual(wrong, [], "age not measured from the newest park: %r" % (wrong[:5],))
+
+    def test_a_re_type_names_its_new_kind_in_to_not_in_kind(self):
+        """MEASURED on the live board: a `block_retyped` payload carries `to` and NO `kind` —
+        which is exactly why `payload.to` is the read for that park kind, and why a
+        `payload.kind`-only reader sees nothing for a card re-typed into a park."""
+        conn = self._ro()
+        rows = conn.execute("SELECT payload FROM task_events WHERE kind='block_retyped' "
+                            "ORDER BY id DESC LIMIT 200").fetchall()
+        conn.close()
+        if not rows:
+            self.skipTest("no `block_retyped` events on this board")
+        wrong = [r["payload"] for r in rows
+                 if api._flow_payload_fields(r["payload"]).get("to") is None
+                 or api._flow_payload_fields(r["payload"]).get("kind") is not None]
+        self.assertEqual(wrong, [],
+                         "a re-type payload broke the JSON-field contract: %r" % (wrong[:2],))
 
     def test_the_board_still_has_cards_the_old_read_would_have_missed(self):
         """POSITIVE CONTROL for the two arms above: this defect is not theoretical here."""
