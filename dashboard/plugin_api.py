@@ -620,20 +620,44 @@ def _park_kinds() -> tuple:
     return tuple(kinds) if kinds else _PARK_KINDS_FALLBACK
 
 
-def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
-    """Newest PARK-EVENT payload per task, over the SAME kinds the scripts read.
+def _park_kind_sql() -> str:
+    """The park kinds as a SQL ``IN (...)`` list — the ONE place they are quoted into SQL.
 
-    A `block_retyped`/`block_loop_detected` event carries the caller's `reason` byte for
-    byte (that is what a re-type in place and the unblock-loop breaker append), so a
-    reader keyed on `blocked` alone reads a SUPERSEDED park — the same triple
-    `owner_ask_filter.park_sql` builds for the scripts, imported via `_park_kinds()`.
-
-    ⛔ This is the ONE park read in this file, and BOTH consumers share it: the exclusion
-    predicates below (WHETHER to show a card) and `_ask_reasons` (WHAT to render as the
-    ask). They read the same payload for the same task by construction.
+    Everything that filters ``task_events`` for a park goes through ``_park_kinds()``; this
+    only renders that tuple for a query, so a reader cannot accidentally quote a list of its
+    own. Blobs are impossible by construction (the names come from the scripts store or from
+    the fallback above), and nothing here is caller-supplied.
     """
-    out: dict[str, str] = {}
-    kinds = ",".join("'%s'" % k for k in _park_kinds())
+    return ",".join("'%s'" % k for k in _park_kinds())
+
+
+def _newest_park_events(conn: sqlite3.Connection,
+                        ids: list[str]) -> dict[str, dict[str, Any]]:
+    """The NEWEST PARK EVENT per task — one entry per task, over ``_park_kinds()``.
+
+    ⛔ A PARK IS A PARK WHICHEVER KIND RECORDED IT. ``block_retyped`` is written when a
+    parked card is re-typed in place and ``block_loop_detected`` when the unblock-loop
+    breaker parks it; both supersede the ``blocked`` event before them. So a reader that
+    takes ``MAX(created_at) WHERE kind='blocked'`` is reading a SUPERSEDED park: measured on
+    the ``tos`` snapshot (clock 1790208969) over its 1 397 cards in blocked/triage, 161 had
+    a newest park over the triple that was NEWER than their newest ``blocked`` event — such
+    a reader's age is stale by a median 2.0 h and up to 160.3 h — and 738 had no ``blocked``
+    event at all, for 726 of which the triple recovers a real park (the rest fell back to
+    the row's ``created_at``, i.e. the FILING date, which is not an age of anything).
+
+    "Newest" is ``MAX(id)``, the events table's own order, never a ``MAX(created_at)`` over
+    several kinds: two events of one card written inside the same second must not be
+    re-ordered by a clock that is not the table's. The returned row carries ``kind``,
+    ``created_at`` and ``payload`` — the payload is the JSON the park kind lives in, and
+    ``_flow_payload_fields`` is how a caller reads it (``payload.kind`` for ``blocked`` /
+    ``block_loop_detected``, ``payload.to`` for ``block_retyped``).
+
+    ``_park_payloads`` is this function's projection, so the exclusion predicates, the
+    ``since`` panel, the insights stuck list and the flow rails cannot disagree about which
+    event a card's park is.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    kinds = _park_kind_sql()
     for chunk in _chunks(ids):
         marks = ",".join("?" * len(chunk))
         latest = {r["task_id"]: r["mid"] for r in conn.execute(
@@ -642,14 +666,28 @@ def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
         if not latest:
             continue
         ev = ",".join("?" * len(latest))
-        by_id = {r["id"]: r["task_id"] for r in conn.execute(
-            f"SELECT id, task_id FROM task_events WHERE id IN ({ev})", list(latest.values()))}
-        for row in conn.execute(f"SELECT id, payload FROM task_events WHERE id IN ({ev})",
-                                list(latest.values())):
-            tid = by_id.get(row["id"])
-            if tid:
-                out[tid] = row["payload"]
+        for row in conn.execute(f"SELECT task_id, kind, created_at, payload FROM task_events "
+                                f"WHERE id IN ({ev})", list(latest.values())):
+            out[row["task_id"]] = {"kind": row["kind"], "created_at": row["created_at"],
+                                   "payload": row["payload"]}
     return out
+
+
+def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """Newest PARK-EVENT payload per task, over the SAME kinds the scripts read.
+
+    A `block_retyped`/`block_loop_detected` event carries the caller's `reason` byte for
+    byte (that is what a re-type in place and the unblock-loop breaker append), so a
+    reader keyed on `blocked` alone reads a SUPERSEDED park — the same triple
+    `owner_ask_filter.park_sql` builds for the scripts, imported via `_park_kinds()`.
+
+    ⛔ This is the ONE park-PAYLOAD read in this file, and BOTH consumers share it: the
+    exclusion predicates below (WHETHER to show a card) and `_ask_reasons` (WHAT to render as
+    the ask). They read the same payload for the same task by construction. A reader that
+    needs the park EVENT rather than its payload — a timestamp, a count — goes through
+    `_newest_park_events` / `_park_kind_sql`, never through a `kind='blocked'` of its own.
+    """
+    return {tid: ev["payload"] for tid, ev in _newest_park_events(conn, ids).items()}
 
 
 def _comments_by_task(conn: sqlite3.Connection, ids: list[str],
@@ -1193,16 +1231,36 @@ def insights(hours: int = Query(48, ge=6, le=336)):
                 blocked_kinds[key] = blocked_kinds.get(key, 0) + int(r["c"])
             per_board.append({"slug": b["slug"], "title": b["title"], "counts": counts})
 
-            for r in _q(conn, """
+            # THE AGE OF A STUCK CARD IS MEASURED FROM ITS NEWEST PARK, whatever kind recorded
+            # it. The predicate here used to be `MAX(created_at) ... WHERE kind='blocked'`, which
+            # cannot see a `block_retyped` or a `block_loop_detected` — a re-typed park IS a new
+            # park, so the age of a card re-parked into the owner's queue was measured from the
+            # superseded park it left behind (161 of 1 397 stuck cards on the tos snapshot, clock
+            # 1790208969, median 2.0 h stale) or, for the 726 with no `blocked` event at all, from
+            # the filing date. Same rule as the rails and `_park_payloads`: the park triple,
+            # through `_newest_park_events`. The route's aging buckets move with it — on that
+            # snapshot, with the clock pinned, [<1h 29, 1-6h 329, 6-24h 630, 1-3d 267, >3d 142]
+            # becomes [124, 796, 271, 122, 84]: most of what the old read called "stuck for days"
+            # was a card dated from its filing, not from any park. Residual, kept and stated
+            # rather than papered over: 84 of the 1 397 have a newest park that a LATER
+            # `unblocked` lifted, and are measured from that park; the alternative is the filing
+            # date, which is not an age of anything.
+            stuck = _q(conn, """
                 SELECT t.id, t.title, t.assignee, COALESCE(t.block_kind,'untyped') AS kind,
-                       COALESCE((SELECT MAX(e.created_at) FROM task_events e
-                                  WHERE e.task_id = t.id AND e.kind = 'blocked'), t.created_at) AS since
+                       t.created_at
                   FROM tasks t WHERE t.status IN ('blocked','triage')
-            """):
+            """)
+            parks = _newest_park_events(conn, [r["id"] for r in stuck])
+            for r in stuck:
+                parked_at = _int_or_none((parks.get(r["id"]) or {}).get("created_at"))
+                # EXPLICIT FALLBACK: a card parked on a board whose event log predates the park
+                # (or was reaped) has no park event at all, and `t.created_at` is then the
+                # earliest defensible origin — the card has been in the queue since it was filed.
+                since_at = parked_at or _int_or_none(r["created_at"]) or now
                 stuck_rows.append({
                     "board": b["slug"], "board_title": b["title"], "id": r["id"], "title": r["title"],
                     "assignee": r["assignee"], "kind": r["kind"],
-                    "age_seconds": now - (_int_or_none(r["since"]) or now),
+                    "age_seconds": now - since_at,
                 })
 
             for r in _q(conn, """
@@ -1226,8 +1284,15 @@ def insights(hours: int = Query(48, ge=6, le=336)):
                 key = _int_or_none(r["b"])
                 if key is not None:
                     completed[key] = completed.get(key, 0) + int(r["c"])
-            for r in _q(conn, "SELECT (created_at/3600)*3600 b, COUNT(*) c FROM task_events "
-                              "WHERE kind='blocked' AND created_at >= ? GROUP BY 1", (since,)):
+            # THE PARK HISTOGRAM COUNTS PARKS, NOT `blocked` EVENTS (kanban t_3d9a7034). Measured
+            # on the tos snapshot (clock 1790208969, 168 h window): 11 098 events under
+            # `kind='blocked'` against 13 787 over the park triple — 2 689 parks (20%) were
+            # invisible on the chart this family exists to make honest, every one of them a
+            # re-type or a loop-break. The route's own histogram sum over that window:
+            # 11 098 -> 13 787.
+            for r in _q(conn, f"SELECT (created_at/3600)*3600 b, COUNT(*) c FROM task_events "
+                              f"WHERE kind IN ({_park_kind_sql()}) AND created_at >= ? GROUP BY 1",
+                        (since,)):
                 key = _int_or_none(r["b"])
                 if key is not None:
                     blocked_ev[key] = blocked_ev.get(key, 0) + int(r["c"])
@@ -1463,7 +1528,21 @@ def since(ts: int = Query(..., ge=0)):
     """What changed since *ts* — the 'since you last looked' panel.
 
     Three movements only: cards opened, cards finished, and cards newly parked *on the owner*
-    (a newest blocked event with kind needs_input after ts). Everything else is noise here.
+    — a NEWEST PARK EVENT on a card whose current park is `needs_input`, at or after *ts*.
+    Everything else is noise here.
+
+    ⛔ "A PARK EVENT" IS THE TRIPLE, not `kind='blocked'`. The park a card is sitting on now
+    may have been recorded as `block_retyped` (re-typed in place) or `block_loop_detected`
+    (the unblock-loop breaker); a card re-parked into the owner's queue by either of those
+    had NO `blocked` event after *ts* and silently disappeared from this panel — measured on
+    the tos snapshot (clock 1790208969), uncapped cards listed by window: 1 h 3 -> 4,
+    6 h 41 -> 48, 24 h 71 -> 82, 168 h 102 -> 102. The short windows are exactly the ones a
+    caller uses; the panel's own LIMIT 40 was already saturated at 6 h and 24 h, so there the
+    fix SWAPS cards rather than lengthening the list — the parks it recovers are ranked by the
+    newest park instead of by the newest `blocked`, which is what "newly parked" means.
+    The park KIND is not read from the event here: `tasks.block_kind` is the core's record of
+    the CURRENT park, written from the same event, so it is the authoritative answer to
+    "is this card parked on the owner right now".
     """
     stamp = _int_or_none(ts) or 0
     opened: list[dict[str, Any]] = []
@@ -1483,10 +1562,11 @@ def since(ts: int = Query(..., ge=0)):
             """, (stamp,)):
                 finished.append({"board": b["slug"], "board_title": b["title"], "id": r["id"],
                                  "title": r["title"], "assignee": r["assignee"], "at": _iso(r["completed_at"])})
-            for r in _q(conn, """
+            park_sql = _park_kind_sql()
+            for r in _q(conn, f"""
                 SELECT t.id, t.title, t.assignee, MAX(e.created_at) AS at
                   FROM tasks t JOIN task_events e ON e.task_id = t.id
-                 WHERE e.kind = 'blocked' AND e.created_at >= ?
+                 WHERE e.kind IN ({park_sql}) AND e.created_at >= ?
                    AND t.status IN ('blocked','triage') AND t.block_kind = 'needs_input'
                  GROUP BY t.id ORDER BY at DESC LIMIT 40
             """, (stamp,)):
