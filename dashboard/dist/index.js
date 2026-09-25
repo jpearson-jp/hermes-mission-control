@@ -213,23 +213,31 @@
     var [msg, setMsg] = useState(null);
     var [err, setErr] = useState(null);
 
-    function send(unblock) {
+    // `choiceOverride` is how the inline accept works in ONE click: React state set in the
+    // same tick is not visible to this closure, so the accepted option is passed THROUGH
+    // rather than read back out of `choice` (kanban t_8723e030).
+    function send(unblock, choiceOverride) {
+      var pick = (choiceOverride === undefined) ? choice : choiceOverride;
       setBusy(true); setErr(null); setMsg(null);
       fetchJSON(API + "/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          board: item.board, task_id: item.id, choice: choice,
-          option_text: choice ? item.options[choice - 1] : null,
+          board: item.board, task_id: item.id, choice: pick,
+          option_text: pick ? (item.options || [])[pick - 1] : null,
           text: text, unblock: unblock
         })
       }).then(function (r) {
         setBusy(false);
-        setMsg("sent — card " + r.status_before + " → " + r.status_after + " (comment #" + r.comment_id + ")");
+        setMsg("sent — option " + (r.choice == null ? "(none)" : r.choice) + ", card " + r.status_before + " → " + r.status_after + " (comment #" + r.comment_id + ")");
         setText("");
         if (props.onDone) props.onDone();
       }).catch(function (e) { setBusy(false); setErr(String((e && e.message) || e)); });
     }
+
+    // The recommendation exists so the owner can take it without reading four paragraphs: one
+    // click, from the list, without opening the row.
+    function acceptRec() { setChoice(item.recommendation); send(true, item.recommendation); }
 
     return h("div", { className: "mc-row" + (props.highlight ? " mc-row-hi" : "") },
       h("div", { className: "mc-row-h" },
@@ -242,7 +250,15 @@
             h("span", null, "parked " + dur(item.age_seconds) + " ago"),
             h("span", null, item.comments + " comments"),
             (item.hints || []).map(function (x) { return h(Pill, { key: x, kind: "mc-pill-warn" }, x); }))),
-        h("button", { className: "mc-btn", onClick: function () { setOpen(!open); } }, open ? "hide" : "open")),
+        h("div", { className: "mc-actions" },
+          h("button", {
+            className: "mc-btn mc-btn-p", disabled: busy || item.recommendation == null,
+            title: item.recommendation == null
+              ? "this card's frame carries no RECOMMENDATION to accept"
+              : "answer option " + item.recommendation + " and re-open the card, without opening the row",
+            onClick: acceptRec
+          }, busy ? "sending…" : "Accept recommendation"),
+          h("button", { className: "mc-btn", onClick: function () { setOpen(!open); } }, open ? "hide" : "open"))),
       h(CardTools, { item: item }),
       item.summary ? h("div", { className: "mc-sum" }, item.summary) : null,
       !open && item.ask ? h("div", { className: "mc-ask" }, item.ask.slice(0, 320) + (item.ask.length > 320 ? "…" : "")) : null,

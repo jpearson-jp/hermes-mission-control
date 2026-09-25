@@ -6,6 +6,8 @@
     var [tag, setTag] = useState(null);
     var [showParked, setShowParked] = useState(false);
     var [detail, setDetail, detailNode] = useDetail();
+    var [bulk, setBulk] = useState(null);
+    var [bulkBusy, setBulkBusy] = useState(false);
     var d = poll.state.data;
 
     if (poll.state.error && !d) return h("div", { className: "mc-root" }, h("div", { className: "mc-err" }, "backend error: " + poll.state.error));
@@ -21,6 +23,32 @@
     var framed = (d.framed || []).filter(match);
     var parked = (d.parked || []).filter(match);
     var oldest = framed.length ? framed[0] : null;
+
+    // ONE act, EVERY card in the list he is looking at. The control sends each card's OWN
+    // recommendation as that card's choice, so the batch cannot drift from what he was shown,
+    // and a refusal is reported PER CARD instead of being swallowed by the batch
+    // (kanban t_8723e030).
+    var recs = framed.filter(function (i) { return i.recommendation != null; });
+    function acceptAll() {
+      setBulkBusy(true); setBulk(null);
+      fetchJSON(API + "/answer_many", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: recs.map(function (i) {
+            return { board: i.board, task_id: i.id, choice: i.recommendation,
+                     option_text: (i.options || [])[i.recommendation - 1] };
+          })
+        })
+      }).then(function (r) {
+        setBulkBusy(false);
+        var bad = (r.results || []).filter(function (x) { return !x.ok; });
+        setBulk("answered " + r.answered + " of " + recs.length +
+          (bad.length ? " — " + bad.length + " refused: " + bad.map(function (x) { return x.task_id + " (" + x.error + ")"; }).join("; ") : "") +
+          (framed.length - recs.length ? " · " + (framed.length - recs.length) + " left alone (no RECOMMENDATION to accept)" : ""));
+        poll.load();
+      }).catch(function (e) { setBulkBusy(false); setBulk("failed: " + String((e && e.message) || e)); });
+    }
 
     return h("div", { className: "mc-root" },
       h(PageHead, {
@@ -60,11 +88,17 @@
         title: "Decisions waiting on you",
         sub: framed.length + (q || tag ? " matching" : "") + " of " + t.framed,
         right: h("div", { className: "mc-filter" },
+          recs.length ? h("button", {
+            className: "mc-btn mc-btn-p", disabled: bulkBusy,
+            title: "answer the recommendation on each of these " + recs.length + " cards, in ONE act",
+            onClick: acceptAll
+          }, bulkBusy ? "sending…" : "Accept all " + recs.length + " recommendations") : null,
           h("input", { className: "mc-input", placeholder: "filter…", value: q, onChange: function (e) { setQ(e.target.value); } }),
           (q || tag) ? h("button", { className: "mc-btn", onClick: function () { setQ(""); setTag(null); } }, "clear") : null)
       },
+        bulk ? h("div", { className: bulk.indexOf("failed") === 0 ? "mc-err" : "mc-ok" }, bulk) : null,
         framed.length
-          ? h("div", { className: "mc-cards" }, framed.map(function (i) { return h(AskRow, { key: i.board + i.id, item: i, onDone: poll.load }); }))
+          ? h("div", { className: "mc-cards mc-cards-scroll" }, framed.map(function (i) { return h(AskRow, { key: i.board + i.id, item: i, onDone: poll.load }); }))
           : h("div", { className: "mc-muted" }, (q || tag) ? "nothing matches that filter." : "Nothing framed for you right now.")),
 
       detailNode,

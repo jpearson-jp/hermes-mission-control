@@ -1012,6 +1012,74 @@ def feed(minutes: int = Query(180, ge=5, le=2880), limit: int = Query(60, ge=5, 
 
 # --- owner writes ------------------------------------------------------------
 
+#: The ONE park kind an owner answer may lift. `_AWAITING_SQL` selects exactly this kind, so a
+#: card the page never showed the owner cannot be answered through the page's write route either.
+OWNER_PARK_KIND = "needs_input"
+
+
+def _owner_answer_refusal(task) -> Optional[str]:
+    '''Why this card must NOT be re-opened by an owner answer, or None when it may be.
+
+    ⛔ MEASURED 2026-09-25 across every board on this box, by `status, block_kind`: 563 cards
+    are parked `capability`, 66 `transient`, 2 `awaiting_publication`, 3 `capability` triage and
+    15 `scheduled` (14 untagged, 2 `dependency`). `/answer` re-opened ANY card in
+    blocked/scheduled, so a bulk accept handed one of those minted an owner approval over a park
+    the owner was never shown and that no owner decision can lift -- and it did it silently,
+    which is the half that makes it expensive.
+
+    The page's own READ (`_AWAITING_SQL`) has always required `block_kind='needs_input'`. This is
+    the SAME predicate on the WRITE path, so the two cannot drift: a card this refuses is a card
+    `/waiting` never listed.
+    '''
+    kind = (getattr(task, "block_kind", None) or "").strip()
+    if kind == OWNER_PARK_KIND:
+        return None
+    return ("parked %s, not %s -- this card is not an owner ask (the page lists block_kind=%s "
+            "only), so an answer here cannot re-open it; use /comment to say something without "
+            "lifting the park" % (kind or "with no block_kind", OWNER_PARK_KIND, OWNER_PARK_KIND))
+
+
+def _card_frame(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    '''The card's framed ask, read through THIS module's own reader.
+
+    `_frame_bodies` is what the page renders the owner's options from, so a verb that resolved an
+    option or a recommendation off any other parse could record an answer for an option the owner
+    was never shown. One reader, one rule.
+    '''
+    return parse_frame(_frame_bodies(conn, [task_id]).get(task_id))
+
+
+def _resolve_choice(frame: dict[str, Any], choice: Optional[int], option_text: Optional[str],
+                    accept_recommended: bool) -> tuple[Optional[int], Optional[str]]:
+    '''(choice, option_text) for an owner answer, with the card's own frame filling the gaps.
+
+    `accept_recommended` is the bulk control's act: the owner accepts the recommendation each
+    card's OWN frame carries, so the server reads it per card rather than trusting a client to
+    have kept N choices in step with N cards. A card whose frame carries no RECOMMENDATION is
+    REFUSED -- never guessed and never silently skipped, because a bulk act that quietly answers
+    fewer cards than the owner believes is how a decision is lost.
+
+    The option TEXT is resolved the same way when a caller sends only an index, so the comment
+    records WHAT was chosen rather than a bare number.
+    '''
+    if choice is None and accept_recommended:
+        rec = frame.get("recommendation")
+        if rec is None:
+            raise HTTPException(
+                status_code=409,
+                detail="no RECOMMENDATION on this card's frame to accept")
+        choice = int(rec)
+    if choice is not None and not (option_text or "").strip():
+        opts = frame.get("options") or []
+        try:
+            idx = int(choice)
+        except (TypeError, ValueError):
+            idx = 0
+        if 1 <= idx <= len(opts):
+            option_text = opts[idx - 1]
+    return choice, option_text
+
+
 class AnswerBody(BaseModel):
     board: str
     task_id: str
@@ -1019,6 +1087,8 @@ class AnswerBody(BaseModel):
     text: Optional[str] = None
     option_text: Optional[str] = None
     unblock: bool = True
+    #: Accept the recommendation the card's OWN frame carries (no client-side choice needed).
+    accept_recommended: bool = False
 
 
 class CommentBody(BaseModel):
@@ -1051,16 +1121,27 @@ def _owner_comment(choice: Optional[int], option_text: Optional[str], text: Opti
 @router.post("/answer")
 def answer(body: AnswerBody):
     """Record the owner's answer on the card and (by default) re-open it for dispatch."""
-    if body.choice is None and not (body.text and body.text.strip()):
+    if (body.choice is None and not body.accept_recommended
+            and not (body.text and body.text.strip())):
         raise HTTPException(status_code=400, detail="provide a choice and/or text")
     with closing(_write_conn(body.board)) as conn:
         task = kanban_db.get_task(conn, body.task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {body.task_id} not found")
         before = task.status
+        # ⛔ THE READ/WRITE PREDICATE, ENFORCED (kanban t_8723e030). Refused BEFORE a byte is
+        # written: a refusal that had already commented would leave the owner's words on a card
+        # whose park it did not lift, which reads as an answer that failed to take.
+        if body.unblock:
+            why = _owner_answer_refusal(task)
+            if why:
+                raise HTTPException(status_code=409, detail=why)
+        frame = _card_frame(conn, body.task_id)
+        choice, option_text = _resolve_choice(frame, body.choice, body.option_text,
+                                              body.accept_recommended)
         comment_id = kanban_db.add_comment(
             conn, body.task_id, "jesse",
-            _owner_comment(body.choice, body.option_text, body.text),
+            _owner_comment(choice, option_text, body.text),
         )
         after = before
         if body.unblock and before in ("blocked", "scheduled"):
@@ -1069,9 +1150,97 @@ def answer(body: AnswerBody):
                 raise HTTPException(status_code=409, detail="unblock refused (state changed?)")
             reread = kanban_db.get_task(conn, body.task_id)
             after = reread.status if reread else "?"
+        elif body.unblock and before == "triage":
+            # ⛔ `unblock` is a no-op on a triage card and NO kanban verb leaves
+            # triage (kanban_db:4889); `specify_triage_task` is the one exit, and
+            # answering without it recorded the decision but left the card in the
+            # owner's queue forever (2026-09-22: 13 such cards).
+            try:
+                kanban_db.specify_triage_task(conn, body.task_id, author="jesse")
+            except AttributeError:
+                pass
+            reread = kanban_db.get_task(conn, body.task_id)
+            after = reread.status if reread else before
         final = kanban_db.get_task(conn, body.task_id)
-    return {"ok": True, "comment_id": comment_id, "status_before": before, "status_after": after,
+    return {"ok": True, "comment_id": comment_id, "choice": choice, "option_text": option_text,
+            "status_before": before, "status_after": after,
             "block_kind": (final.block_kind if final else None)}
+
+
+class AnswerManyItem(BaseModel):
+    board: str
+    task_id: str
+    choice: Optional[int] = None
+    option_text: Optional[str] = None
+    text: Optional[str] = None
+    unblock: bool = True
+    #: Accept THIS card's own recommendation, read server-side (see _resolve_choice).
+    accept_recommended: bool = False
+
+
+class AnswerManyBody(BaseModel):
+    """One bulk owner act. TWO shapes, ONE loop.
+
+    `items` is the explicit form: one entry per ask, carrying the option the owner was SHOWN --
+    what the page sends, because the owner's act must be over what he saw.
+
+    The flat `board` + `ids` + (`option` | `accept_recommended`) form is the one the owner-ask
+    card names, so the whole act is also one curl:
+
+        curl -X POST .../answer_many \
+          -d '{"board":"tos","ids":["t_a","t_b"],"accept_recommended":true}'
+    """
+    items: list[AnswerManyItem] = []
+    board: Optional[str] = None
+    ids: list[str] = []
+    option: Optional[int] = None
+    accept_recommended: bool = False
+    text: Optional[str] = None
+    unblock: bool = True
+
+
+@router.post("/answer_many")
+def answer_many(body: AnswerManyBody):
+    """Bulk owner answers ("Accept all recommendations"). Independent per-item results.
+
+    ⛔ EVERY ITEM, NOT THE FIRST (kanban t_8723e030). The framed list is N asks, each with its
+    OWN `RECOMMENDATION:` line, and the control that answers them is ONE act -- so a loop that
+    returned after the first item, or a client that sent only `ids[0]`, would leave the owner
+    believing he had cleared a list he had not. The per-item result list is the evidence of what
+    actually happened: a refusal is reported against its own card and is never swallowed by the
+    batch, and the count of answered vs failed is returned beside it.
+    """
+    items = list(body.items)
+    if body.ids:
+        if not body.board:
+            raise HTTPException(status_code=400,
+                                detail="`ids` needs `board` -- card ids are per-board")
+        if body.option is None and not body.accept_recommended:
+            raise HTTPException(status_code=400,
+                                detail="`ids` needs `option` or accept_recommended=true")
+        for tid in body.ids:
+            items.append(AnswerManyItem(board=body.board, task_id=tid, choice=body.option,
+                                        text=body.text, unblock=body.unblock,
+                                        accept_recommended=body.accept_recommended))
+    if not items:
+        raise HTTPException(status_code=400,
+                            detail="nothing to answer: pass `items`, or `board` + `ids`")
+    results = []
+    for it in items:
+        try:
+            r = answer(AnswerBody(board=it.board, task_id=it.task_id, choice=it.choice,
+                                  option_text=it.option_text, text=it.text, unblock=it.unblock,
+                                  accept_recommended=(it.accept_recommended
+                                                      or body.accept_recommended)))
+            results.append({"board": it.board, "task_id": it.task_id, "ok": True,
+                            "choice": r.get("choice"), "option_text": r.get("option_text"),
+                            "status_before": r.get("status_before"), "status_after": r.get("status_after")})
+        except HTTPException as e:
+            results.append({"board": it.board, "task_id": it.task_id, "ok": False, "error": e.detail})
+        except Exception as e:
+            results.append({"board": it.board, "task_id": it.task_id, "ok": False, "error": str(e)})
+    ok = sum(1 for r in results if r["ok"])
+    return {"ok": True, "answered": ok, "failed": len(results) - ok, "results": results}
 
 
 @router.post("/comment")
