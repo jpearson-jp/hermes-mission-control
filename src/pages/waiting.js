@@ -1,5 +1,35 @@
 /* Mission Control — the owner's inbox: every decision parked on Jesse, oldest first. */
 
+  // ── THE FOURTH BUCKET THIS PAGE USED TO DROP (kanban tos:t_4a19b847) ─────────────────────────
+  // `GET /waiting` returns `totals` AND `excluded = {count, by_reason, named}`. Those exclusions are
+  // deliberate — already answered, publication-only, duplicate of a carrier that IS shown — and the
+  // backend NAMES them, because "a bucket the UI does not render renders as a wrong total on the
+  // page and nothing else". This page rendered three tiles and summed framed+parked, so it read 130
+  // (+2) against a true 142 and named none of the 12 cards the inbox had declined to show.
+  // ⛔ THE NUMBERS COME FROM THE PAYLOAD. Nothing here re-measures a board; these two helpers only
+  // FORMAT what the payload already carries.
+  function mcExcludedReasons(exc) {
+    var by = (exc && exc.by_reason) || {};
+    return Object.keys(by).sort(function (a, b) { return by[b] - by[a]; })
+      .map(function (k) { return num(by[k]) + " " + k; }).join(" · ");
+  }
+
+  // One row per NAMED exclusion. The named entries are `"<board>/<id> <reason>"` strings, and a
+  // duplicate's reason carries its CARRIER (`duplicate of <board>/<id>`) — the card that answered
+  // it, which is what the row's click-through has to open.
+  function mcExcludedRows(exc) {
+    return ((exc && exc.named) || []).map(function (line) {
+      var s = String(line).trim();
+      var sp = s.indexOf(" ");
+      var key = sp === -1 ? s : s.slice(0, sp);
+      var reason = sp === -1 ? "" : s.slice(sp + 1);
+      var slash = key.indexOf("/");
+      var m = /\bduplicate of\s+([A-Za-z0-9_-]+\/[A-Za-z0-9_-]+)/.exec(reason);
+      return { key: key, reason: reason, board: slash === -1 ? "" : key.slice(0, slash),
+               id: slash === -1 ? key : key.slice(slash + 1), carrier: m ? m[1] : null };
+    });
+  }
+
   function WaitingPage() {
     var poll = usePoll("/waiting", 30000);
     var [q, setQ] = useState("");
@@ -20,12 +50,23 @@
     };
     var framed = (d.framed || []).filter(match);
     var parked = (d.parked || []).filter(match);
-    var oldest = framed.length ? framed[0] : null;
+    var oldest = (d.framed || [])[0] || null;  // payload is oldest-first; the FILTER must not move it
+
+    // The excluded bucket, straight off the payload — never recomputed. `recoTotal` counts the
+    // framed asks that carry a RECOMMENDATION, which is what the headline is allowed to promise.
+    var exc = d.excluded || {};
+    var excCount = Number(exc.count || 0) || 0;
+    var excWhy = mcExcludedReasons(exc);
+    var excRows = mcExcludedRows(exc);
+    var framedTotal = Number(t.framed == null ? (d.framed || []).length : t.framed) || 0;
+    var parkedTotal = Number(t.parked == null ? (d.parked || []).length : t.parked) || 0;
+    var needsTotal = t.needs_input == null ? null : Number(t.needs_input);
+    var recoTotal = (d.framed || []).filter(function (i) { return i.recommendation != null; }).length;
 
     return h("div", { className: "mc-root" },
       h(PageHead, {
         title: "Waiting on Me",
-        sub: "updated " + hhmm(d.generated_at) + " · " + t.framed + " real asks · " + t.parked + " other parks"
+        sub: "updated " + hhmm(d.generated_at) + " · " + recoTotal + " of " + framedTotal + " real asks carry a recommendation · " + excCount + " excluded · " + parkedTotal + " other parks"
       },
         h("div", { className: "mc-filter" },
           h("a", { className: "mc-btn", href: "/mission-control" }, "← Mission Control"),
@@ -33,12 +74,24 @@
           h("button", { className: "mc-btn", onClick: poll.load }, "refresh"))),
 
       h("div", { className: "mc-stats" },
-        h(Stat, { k: "decisions waiting", v: t.framed, n: "framed with options + a recommendation",
-                  tone: t.framed ? "warn" : null }),
+        h(Stat, { k: "asks with a recommendation", v: recoTotal,
+                  n: recoTotal + " of " + framedTotal + " framed asks with options" + (excCount ? " · " + excCount + " excluded (" + excWhy + ")" : ""),
+                  tone: framedTotal ? "warn" : null }),
+        h(Stat, { k: "excluded from this inbox", v: excCount, n: excWhy || "nothing excluded",
+                  tone: excCount ? "warn" : null }),
         h(Stat, { k: "oldest wait", v: oldest ? dur(oldest.age_seconds) : "—",
                   n: oldest ? oldest.assignee : "" }),
-        h(Stat, { k: "other parks", v: t.parked, n: "parked, no framed ask yet" }),
+        h(Stat, { k: "other parks", v: parkedTotal, n: "parked, no framed ask yet" }),
+        h(Stat, { k: "needs_input total", v: needsTotal == null ? "—" : num(needsTotal),
+                  n: needsTotal == null ? "includes internal flips"
+                    : framedTotal + " framed + " + parkedTotal + " parked + " + excCount + " excluded = " + num(needsTotal) + " of " + num(needsTotal) }),
         h(Stat, { k: "boards", v: (d.boards || []).length, n: (d.boards || []).map(function (b) { return b.slug; }).join(", ") })),
+
+      // The receipt, in one line, so a reader can check the arithmetic without opening the API. The
+      // four buckets come from the payload; none of them is re-derived on this page.
+      needsTotal == null ? null : h("div", { className: "mc-muted mc-recon" },
+        "reconciled: " + framedTotal + " framed (" + recoTotal + " with a recommendation) + " + parkedTotal +
+        " parked + " + excCount + " excluded = " + num(needsTotal) + " of " + num(needsTotal) + " needs_input — exclusions are named at the foot of this page, never silently dropped"),
 
       h(Panel, { title: "How long they have been waiting", sub: "every framed ask, by age" },
         h("div", { className: "mc-split" },
@@ -58,14 +111,17 @@
 
       h(Panel, {
         title: "Decisions waiting on you",
-        sub: framed.length + (q || tag ? " matching" : "") + " of " + t.framed,
+        sub: framed.length + (q || tag ? " matching" : "") + " of " + framedTotal +
+             " framed asks with options · " + recoTotal + " carry a recommendation" + (excCount ? " · " + excCount + " excluded (" + excWhy + ")" : ""),
         right: h("div", { className: "mc-filter" },
           h("input", { className: "mc-input", placeholder: "filter…", value: q, onChange: function (e) { setQ(e.target.value); } }),
           (q || tag) ? h("button", { className: "mc-btn", onClick: function () { setQ(""); setTag(null); } }, "clear") : null)
       },
         framed.length
           ? h("div", { className: "mc-cards" }, framed.map(function (i) { return h(AskRow, { key: i.board + i.id, item: i, onDone: poll.load }); }))
-          : h("div", { className: "mc-muted" }, (q || tag) ? "nothing matches that filter." : "Nothing framed for you right now.")),
+          : h("div", { className: "mc-muted" }, (q || tag) ? "nothing matches that filter."
+              : excCount ? "Nothing framed for you right now — but " + excCount + " card(s) are EXCLUDED from this inbox, not absent: they are named below under “Excluded (" + excCount + ")”, with the reason each was removed."
+              : "Nothing framed for you right now.")),
 
       detailNode,
 
@@ -89,5 +145,29 @@
             h("div", { className: "mc-actions" },
               h("button", { className: "mc-btn mc-btn-p", onClick: function () { setDetail({ board: i.board, id: i.id }); } }, "read & answer"),
               h(CardTools, { item: i })));
-        })) : null));
+        })) : null),
+
+      // ── The collapsed row: EVERY excluded card, by name, with the reason it was removed. It
+      // renders whenever the payload reports exclusions — a bucket the UI declines to render is how
+      // 12 cards became invisible and how the totals stopped reconciling (kanban tos:t_4a19b847).
+      excCount ? h(Panel, {
+        title: "Excluded (" + excCount + ")",
+        sub: "removed from this inbox, and why — " + (excWhy || "see the rows below")
+      },
+        h("div", { className: "mc-muted" },
+          "These cards are parked needs_input, but they are NOT open asks: the backend removed them from the list above and named them here instead of dropping them. " + excCount + " card(s): " + (excWhy || "") + "."),
+        h("details", { className: "mc-exc" },
+          h("summary", { className: "mc-exc-s" }, "show the " + excCount + " excluded card(s) and the reason each was removed"),
+          excRows.map(function (e) {
+            return h("div", { key: e.key, className: "mc-row" },
+              h("div", { className: "mc-row-t" }, e.key),
+              h("div", { className: "mc-row-m" },
+                h("span", { className: "mc-chip mc-chip-warn" }, "excluded from Waiting-on-Me: " + e.reason),
+                e.carrier ? h("a", { className: "mc-link", onClick: function () {
+                  setDetail({ board: e.carrier.split("/")[0], id: e.carrier.split("/")[1] });
+                } }, "the card that answered it → " + e.carrier) : null,
+                h("a", { className: "mc-link", onClick: function () {
+                  setDetail({ board: e.board, id: e.id });
+                } }, "open card")));
+          }))) : null);
   }

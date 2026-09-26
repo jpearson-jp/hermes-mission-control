@@ -93,6 +93,13 @@ table.mc-table tr:hover td { background: color-mix(in srgb, var(--color-ring) 6%
 .mc-chip { border: 1px solid var(--color-border); background: transparent; color: var(--color-muted-foreground);
   border-radius: 999px; padding: .18rem .6rem; font-size: .72rem; cursor: pointer; }
 .mc-chip-on { border-color: var(--color-ring); color: var(--color-foreground); background: color-mix(in srgb, var(--color-ring) 12%, transparent); }
+.mc-chip-warn { border-color: color-mix(in srgb, var(--color-destructive) 45%, var(--color-border));
+  color: color-mix(in srgb, var(--color-destructive) 75%, var(--color-foreground)); cursor: default; }
+/* --- the excluded bucket: a collapsed row that NAMES what the inbox declined to show --- */
+.mc-exc { border: 1px solid var(--color-border); border-radius: var(--radius, .5rem); padding: .35rem .6rem; }
+.mc-exc > summary { cursor: pointer; font-size: .74rem; color: var(--color-muted-foreground); }
+.mc-exc[open] > summary { margin-bottom: .35rem; }
+.mc-recon { margin-top: .5rem; }
 .mc-input { border: 1px solid var(--color-border); background: transparent; color: var(--color-foreground);
   border-radius: var(--radius, .5rem); padding: .2rem .5rem; font-size: .75rem; }
 .mc-err { color: var(--color-destructive); font-size: .76rem; }
