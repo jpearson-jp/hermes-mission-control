@@ -93,6 +93,9 @@ const CSS = `
 .mc-chip-on { border-color: var(--ui-accent); color: var(--ui-text-primary); }
 .mc-chip-hot { border-color: color-mix(in srgb,var(--ui-accent) 55%,var(--ui-stroke-secondary)); color: var(--ui-accent); }
 .mc-chip-warn { border-color: color-mix(in srgb,var(--ui-text-quaternary) 60%,var(--ui-stroke-secondary)); }
+.mc-exc { border: 1px solid var(--ui-stroke-secondary); border-radius: 8px; padding: 6px 10px; }
+.mc-exc > summary { cursor: pointer; font-size: 11px; color: var(--ui-text-secondary); }
+.mc-exc[open] > summary { margin-bottom: 6px; }
 .mc-chip-ok { border-color: color-mix(in srgb,var(--ui-text-quaternary) 40%,var(--ui-stroke-secondary)); }
 .mc-chip-dim { opacity: .6; }
 .mc-flow { display: flex; flex-direction: column; gap: 10px; }
@@ -917,6 +920,36 @@ function UnownedPanel({ profiles }) {
 
 // ---------------------------------------------------------------- Waiting on Me (its own page)
 
+// ── THE FOURTH BUCKET THIS PAGE USED TO DROP (kanban tos:t_4a19b847) ──────────────────────────
+// `GET /waiting` returns `totals` AND `excluded = {count, by_reason, named}`. Those exclusions are
+// deliberate — already answered, publication-only, duplicate of a carrier that IS shown — and the
+// backend NAMES them, because "a bucket the UI does not render renders as a wrong total on the page
+// and nothing else". This page rendered three tiles and summed framed+parked, so it read 130 (+2)
+// against a true 142 and named none of the 12 cards the inbox had declined to show.
+// ⛔ THE NUMBERS COME FROM THE PAYLOAD. Nothing below re-measures a board; `excludedReasons` and
+// `excludedRows` only FORMAT what the payload already carries.
+function excludedReasons(exc) {
+  const by = (exc && exc.by_reason) || {}
+  return Object.keys(by).sort((a, b) => by[b] - by[a])
+    .map(k => `${fmtNum(by[k])} ${k}`).join(' · ')
+}
+
+// One row per NAMED exclusion. The named entries are `"<board>/<id> <reason>"` strings, and a
+// duplicate's reason carries its CARRIER (`duplicate of <board>/<id>`) — the card that answered it,
+// which is what a row's hand-off has to reach.
+function excludedRows(exc) {
+  return ((exc && exc.named) || []).map(line => {
+    const s = String(line).trim()
+    const sp = s.indexOf(' ')
+    const key = sp === -1 ? s : s.slice(0, sp)
+    const reason = sp === -1 ? '' : s.slice(sp + 1)
+    const slash = key.indexOf('/')
+    const m = /\bduplicate of\s+([A-Za-z0-9_-]+\/[A-Za-z0-9_-]+)/.exec(reason)
+    return { key, reason, board: slash === -1 ? '' : key.slice(0, slash),
+             id: slash === -1 ? key : key.slice(slash + 1), carrier: m ? m[1] : null }
+  })
+}
+
 function WaitingOnMePage() {
   useCss()
   const w = useRest('/waiting', 45000)
@@ -926,6 +959,23 @@ function WaitingOnMePage() {
     jsx(ErrorState, { title: 'Waiting on Me is unreachable', hint: 'the backend answered an error — check the dashboard service' }) ] })
   if (!d) return jsxs('div', { className: 'mc-page', children: jsx(GlyphSpinner, {}) })
   const t = d.totals || {}
+  const exc = d.excluded || {}
+  const excCount = Number(exc.count || 0) || 0
+  const excWhy = excludedReasons(exc)
+  const excRows = excludedRows(exc)
+  const framedTotal = Number(t.framed ?? (d.framed || []).length) || 0
+  // ⛔ THE HEADLINE COUNTS WHAT HE CAN ACTUALLY DO: a framed ask carrying a RECOMMENDATION. MEASURED
+  // 2026-09-26 (kanban tos:t_4a19b847): 52 framed asks, only 45 carrying a recommendation — the same
+  // 45 the bulk "Accept all" control offers — while the tile read 52. The 7 without one are still
+  // framed asks, so the framed TOTAL stays visible in the note (the wire's `framed_total` is not
+  // touched by this page).
+  const recoTotal = (d.framed || []).filter(i => i.recommendation != null).length
+  const parkedTotal = Number(t.parked ?? (d.parked || []).length) || 0
+  const needsTotal = t.needs_input == null ? null : Number(t.needs_input)
+  // `d.framed` arrives OLDEST FIRST, and /waiting carries no `oldest_seconds` key at all — the tile's
+  // old `fmtAge(d.oldest_seconds)` printed '—' on every render (measured 2026-09-26 on the live
+  // payload). The oldest ask is the first framed row, so read it from there.
+  const oldestAsk = (d.framed || [])[0]
   const match = x => {
     if (!q.trim()) return true
     const s = q.toLowerCase()
@@ -936,7 +986,7 @@ function WaitingOnMePage() {
   return jsxs('div', { className: 'mc-page', children: [
     jsxs('div', { className: 'mc-head', children: [
       jsx('div', { className: 'mc-sec-t', style: { fontSize: '15px' }, children: 'Waiting on Me' }),
-      jsx('div', { className: 'mc-sec-s', children: `only what needs a decision from you · updated ${ago(d.generated_at)}` }),
+      jsx('div', { className: 'mc-sec-s', children: `only what needs a decision from you · oldest wait ${oldestAsk ? fmtAge(oldestAsk.age_seconds) : '—'} · updated ${ago(d.generated_at)}` }),
       jsx('div', { style: { flex: '1 1 auto' } }),
       jsx('input', {
         className: 'mc-search', placeholder: 'filter…', value: q, onChange: e => setQ(e.target.value)
@@ -944,17 +994,28 @@ function WaitingOnMePage() {
       jsx(Button, { variant: 'ghost', size: 'sm', onClick: () => invalidate(), children: 'refresh' })
     ] }),
     jsxs('div', { className: 'mc-tiles', children: [
-      jsx(Tile, { k: 'asks with options', v: fmtNum(t.framed ?? framed.length), n: `oldest ${fmtAge(d.oldest_seconds)}`, tone: (t.framed || framed.length) ? 'warn' : undefined }),
-      jsx(Tile, { k: 'parked, no ask', v: fmtNum(t.parked ?? parked.length), n: 'held by a bot, nothing for you to decide' }),
-      jsx(Tile, { k: 'needs_input total', v: fmtNum(t.needs_input), n: 'includes internal flips' })
+      jsx(Tile, { k: 'asks with options', v: fmtNum(recoTotal),
+        n: `${fmtNum(recoTotal)} of ${fmtNum(framedTotal)} framed asks with options` +
+           (excCount ? ` · ${fmtNum(excCount)} excluded (${excWhy})` : ''),
+        tone: framedTotal ? 'warn' : undefined }),
+      jsx(Tile, { k: 'parked, no ask', v: fmtNum(parkedTotal), n: 'held by a bot, nothing for you to decide' }),
+      jsx(Tile, { k: 'excluded from this inbox', v: fmtNum(excCount), n: excWhy || 'nothing excluded',
+        tone: excCount ? 'warn' : undefined }),
+      jsx(Tile, { k: 'needs_input total', v: needsTotal == null ? '—' : fmtNum(needsTotal),
+        n: needsTotal == null ? 'includes internal flips'
+          : `${fmtNum(framedTotal)} framed + ${fmtNum(parkedTotal)} parked + ${fmtNum(excCount)} excluded = ${fmtNum(needsTotal)} of ${fmtNum(needsTotal)}` })
     ] }),
     framed.length
       ? jsx(Section, {
           title: 'Answer in place',
-          sub: `${framed.length} ask${framed.length === 1 ? '' : 's'} with options · pick one, or use the recommendation`,
+          sub: `${framed.length} shown · ${framed.filter(i => i.recommendation != null).length} carry a recommendation · of ${fmtNum(framedTotal)} framed asks with options`,
           children: framed.map(i => jsx(AskRow, { item: i, onDone: () => invalidate() }, `${i.board}${i.id}`))
         })
-      : jsx(Section, { title: 'Nothing is waiting on you', children: jsx(EmptyState, { title: 'clear board', hint: 'asks show up here the moment a bot frames options for you' }) }),
+      : jsx(Section, { title: 'Nothing framed for you right now', children: jsx(EmptyState, {
+          title: excCount ? 'no open ask — but this inbox is NOT empty' : 'clear board',
+          hint: excCount
+            ? `${fmtNum(excCount)} card(s) were EXCLUDED from this inbox, not absent — every one is named below under “Excluded (${fmtNum(excCount)})”.`
+            : 'asks show up here the moment a bot frames options for you' }) }),
     parked.length
       ? jsx(Section, {
           title: 'Parked, nothing to decide',
@@ -968,6 +1029,37 @@ function WaitingOnMePage() {
               jsx('span', { children: `parked ${fmtAge(i.age_seconds)}` })
             ] })
           ] }, `${i.board}${i.id}`))
+        })
+      : null,
+    // ── The collapsed row: EVERY excluded card, by name, with the reason it was removed. It renders
+    // whenever the payload reports exclusions — a bucket the UI declines to render is how 12 cards
+    // became invisible and how the totals stopped reconciling (kanban tos:t_4a19b847).
+    excCount
+      ? jsx(Section, {
+          title: `Excluded (${fmtNum(excCount)})`,
+          sub: `removed from this inbox, and why — ${excWhy || 'see the rows below'}`,
+          children: jsx('details', { className: 'mc-exc', children: [
+            jsx('summary', { className: 'mc-exc-s', children: `show the ${fmtNum(excCount)} excluded card(s) and the reason each was removed` }),
+            ...excRows.map(e => jsxs('div', { className: 'mc-row', children: [
+              jsx('div', { className: 'mc-row-t', children: e.key }),
+              jsxs('div', { className: 'mc-row-m', children: [
+                jsx('span', { className: 'mc-chip mc-chip-warn', children: `excluded from Waiting-on-Me: ${e.reason}` }),
+                e.carrier ? jsx('span', { children: `answered by ${e.carrier}` }) : null,
+                jsx(Button, {
+                  variant: 'ghost', size: 'sm',
+                  onClick: () => quiet(() => { void ctx_writeClipboard(e.id) }),
+                  children: 'copy id'
+                }),
+                jsx(Button, {
+                  variant: 'ghost', size: 'sm',
+                  onClick: () => quiet(() => {
+                    void ctx_writeClipboard(e.carrier || e.key); host.navigate('/chat')
+                  }),
+                  children: e.carrier ? `chat about ${e.carrier} ↗` : 'chat about it ↗'
+                })
+              ] })
+            ] }, e.key))
+          ] })
         })
       : null
   ] })
@@ -1476,14 +1568,23 @@ function FlowPage() {
 function WaitingChip() {
   const waiting = useRest('/waiting', 60000)
   const framed = waiting.data?.totals?.framed
-  const label = framed == null ? '…' : `${framed} waiting`
-  return jsx(Tip, { label: framed ? `${framed} decisions are parked on you` : 'nothing waiting on you', children: jsx('button', {
+  // ⛔ THE SAME TWO DEFECTS AS THE PAGE, IN THE ONE READER THAT SITS ON EVERY SCREEN (kanban
+  // tos:t_4a19b847): the chip read the FRAMED total (52) and called all of it "decisions parked on
+  // you", while only 45 carry a recommendation — and it never mentioned the 12 the inbox EXCLUDES.
+  // It reads the same /waiting body the page does, so the same three figures are already here.
+  const reco = (waiting.data?.framed || []).filter(i => i.recommendation != null).length
+  const excCount = Number(waiting.data?.excluded?.count || 0) || 0
+  const label = framed == null ? '…' : `${reco} waiting`
+  const tip = framed == null ? 'reading the waiting list…'
+    : (reco ? `${reco} of ${framed} framed asks carry a recommendation` : 'nothing waiting on you') +
+      (excCount ? ` · ${excCount} excluded from the inbox` : '')
+  return jsx(Tip, { label: tip, children: jsx('button', {
     type: 'button',
     className: cn('inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] transition-colors',
       'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'),
     onClick: () => { haptic('tap'); host.navigate(WAITING) },
     children: [
-      framed ? jsx('span', { className: 'mc-dot' }) : null,
+      reco ? jsx('span', { className: 'mc-dot' }) : null,
       jsx('span', { children: label })
     ]
   }) })
