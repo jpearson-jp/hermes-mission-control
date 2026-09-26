@@ -53,6 +53,15 @@ _FRAME_MARKER = "OPTIONS FOR THE OWNER"
 # reading one as a block is what un-framed nine live owner asks (kanban t_c8674e51).
 _FRAME_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*OPTIONS FOR THE OWNER[ \t]*$", re.M | re.I)
 _REC_RE = re.compile(r"\*\*RECOMMENDATION:\s*(\d+)\*\*")
+#: ⛔ THE OWNER-ACTION TRAILER (kanban t_d4fc2d80). The ONE classification an applier may not
+#: treat as a decision: selecting the option it names is an act the OWNER performs (paste a live
+#: read, sign in, open a console), so this route RECORDS the selection and leaves the card in his
+#: queue -- it must not `unblock` it, and must not lift a `triage` park through
+#: `specify_triage_task`. Same closed-vocabulary trailer form as `**RECOMMENDATION: N**`, and the
+#: shared parser `lib/owner_options.py` is the authority; `_owner_action_local` below is the
+#: heading-anchored fallback for a parser revision that predates the vocabulary.
+_OWNER_ACTION_RE = re.compile(r"^\s*\*\*OWNER ACTION:\s*(\d)\*\*\s*[-—:]?\s*(.*?)\s*$",
+                              re.I | re.M)
 _OPT_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
 _HUMAN_HINT_RE = re.compile(r"\bjesse\b|\bowner\b|\byour call\b|\bneeds your\b", re.I)
 
@@ -227,7 +236,7 @@ def parse_frame(text: Optional[str]) -> dict[str, Any]:
     replaces.
     """
     out: dict[str, Any] = {"framed": False, "options": [], "recommendation": None,
-                           "summary": None, "raw": None}
+                           "summary": None, "raw": None, "owner_action": None}
     if not text:
         return out
     mod = _owner_options()
@@ -242,6 +251,32 @@ def parse_frame(text: Optional[str]) -> dict[str, Any]:
     return _frame_local(out, text)
 
 
+def _owner_action_local(text: str) -> Optional[int]:
+    """The option NUMBER the block's own `**OWNER ACTION: N**` trailer names, or None.
+
+    ⛔ THE FALLBACK, NOT THE RULE. `lib/owner_options.py` is the ONE parser and its `owner_action`
+    field is what this page reads; this exists so a plugin revision cannot OUTRUN the parser
+    revision it ships against -- the trailer is a closed-vocabulary line, and reading it here is
+    the same class as `_frame_local`'s heading-anchored parse (that function's own comment says a
+    page that silently hid every ask would be the worse failure). A trailing test arm binds the
+    two on one fixture, so a drift in the marker's spelling fails a check rather than silently
+    promoting a card.
+
+    ⛔ IT READS THE LINE, NEVER THE PROSE: an option that merely SAYS "do it yourself" is a lane
+    decision as far as this page is concerned, which is the id-polarity trap the trailer exists
+    to remove.
+    """
+    if not text:
+        return None
+    m = _OWNER_ACTION_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _frame_from_parsed(out: dict[str, Any], text: str,
                        parsed: Optional[dict]) -> dict[str, Any]:
     """This page's shape, from `lib/owner_options.parse`'s verdict (``None`` == refused)."""
@@ -250,10 +285,17 @@ def _frame_from_parsed(out: dict[str, Any], text: str,
     options = [t for _num, t in parsed["options"]]
     rec = _int_or_none(parsed.get("recommend"))
     head = _last_frame_heading(text)
+    # ⛔ ONE RULE, TWO REVISIONS. The shared parser carries `owner_action` from the revision that
+    # introduces the vocabulary; a parser OLDER than that has no key at all, and reading it as
+    # "no owner action" would make this fix inert until the scripts store installs. So an ABSENT
+    # key falls back to the same closed trailer (never to the option's prose).
+    act = (_int_or_none(parsed.get("owner_action")) if "owner_action" in parsed
+           else _owner_action_local(text))
     out.update({
         "framed": True,
         "options": [t[:OPTION_PREVIEW_CHARS] for t in options],
         "recommendation": rec if rec and 1 <= rec <= len(options) else None,
+        "owner_action": act if act and 1 <= act <= len(options) else None,
         "summary": (parsed.get("summary") or "")[:ASK_PREVIEW_CHARS] or None,
         "raw": (text[head.end():].strip()[:4000] if head else ""),
     })
@@ -304,6 +346,8 @@ def _frame_local(out: dict[str, Any], text: str) -> dict[str, Any]:
         "framed": True,
         "options": [t[:OPTION_PREVIEW_CHARS] for t in texts],
         "recommendation": int(rec.group(1)) if rec and 1 <= int(rec.group(1)) <= len(numbers) else None,
+        "owner_action": (lambda n: n if n and 1 <= n <= len(numbers) else None)(
+            _owner_action_local(text)),
         "summary": (summary or "")[:ASK_PREVIEW_CHARS] or None,
         "raw": tail.strip()[:4000],
     })
@@ -1142,7 +1186,8 @@ def _write_conn(slug: str):
     return kbc.connect(board=slug)
 
 
-def _owner_comment(choice: Optional[int], option_text: Optional[str], text: Optional[str]) -> str:
+def _owner_comment(choice: Optional[int], option_text: Optional[str], text: Optional[str],
+                   owner_action: bool = False) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"**OWNER DECISION** — answered from Mission Control ({stamp})", ""]
     if choice is not None:
@@ -1150,6 +1195,16 @@ def _owner_comment(choice: Optional[int], option_text: Optional[str], text: Opti
         if chosen and chosen[-1] not in ".!?":
             chosen += "."
         lines.append(f"Option {choice} chosen" + (f": {chosen}" if chosen else "."))
+    if owner_action:
+        # ⛔ WHY THIS LINE IS HERE (kanban t_d4fc2d80). The selection IS his act and belongs on the
+        # card, but the card does NOT move on it: the park lifts when the act itself lands (his
+        # paste / sign-in / console), never on this recording. Saying so is what keeps a silent
+        # no-move from looking like a failed answer -- the reason the refusal arm above writes
+        # "a refused answer must write NOTHING" is the same reason.
+        lines.append("")
+        lines.append("⛔ This option is an **OWNER ACTION** — recorded here, and the card stays in "
+                     "your queue: no lane can carry it out. The park lifts on the act itself, "
+                     "not on this selection.")
     if text and text.strip():
         lines.append("")
         lines.append(text.strip())
@@ -1177,17 +1232,32 @@ def answer(body: AnswerBody):
         frame = _card_frame(conn, body.task_id)
         choice, option_text = _resolve_choice(frame, body.choice, body.option_text,
                                               body.accept_recommended)
+        # ⛔ AN OWNER ACTION IS NOT A DECISION (kanban t_d4fc2d80). MEASURED three times round on
+        # `protection-suite:t_01242e2d`: the frame's option 1 was "do the short read yourself",
+        # the owner selected it, and this route read the selection as a machine-applicable
+        # DECISION -- it lifted the park and re-dispatched a lane that provably cannot hold a
+        # platform-owner session (every machine mint is `is_platform_owner:false`). The lane
+        # re-measured the same 401 wall, parked `needs_input` again, tripped the block-loop
+        # breaker into `triage`, and the SAME question came back to the owner. Three lane runs,
+        # no artifact. So: the selection is RECORDED, and NOTHING moves. The classification is the
+        # frame's OWN `**OWNER ACTION: N**` trailer -- never a guess at the option's prose.
+        owner_action = bool(choice is not None and frame.get("owner_action") == choice)
         comment_id = kanban_db.add_comment(
             conn, body.task_id, "jesse",
-            _owner_comment(choice, option_text, body.text),
+            _owner_comment(choice, option_text, body.text, owner_action=owner_action),
         )
         after = before
-        if body.unblock and before in ("blocked", "scheduled"):
+        promoted = False
+        if owner_action:
+            # the card stays exactly where it is: still in the owner's queue, still `needs_input`
+            pass
+        elif body.unblock and before in ("blocked", "scheduled"):
             ok = kanban_db.unblock_task(conn, body.task_id)
             if not ok:
                 raise HTTPException(status_code=409, detail="unblock refused (state changed?)")
             reread = kanban_db.get_task(conn, body.task_id)
             after = reread.status if reread else "?"
+            promoted = after != before
         elif body.unblock and before == "triage":
             # ⛔ `unblock` is a no-op on a triage card and NO kanban verb leaves
             # triage (kanban_db:4889); `specify_triage_task` is the one exit, and
@@ -1199,9 +1269,11 @@ def answer(body: AnswerBody):
                 pass
             reread = kanban_db.get_task(conn, body.task_id)
             after = reread.status if reread else before
+            promoted = after != before
         final = kanban_db.get_task(conn, body.task_id)
     return {"ok": True, "comment_id": comment_id, "choice": choice, "option_text": option_text,
             "status_before": before, "status_after": after,
+            "owner_action": owner_action, "promoted": promoted,
             "block_kind": (final.block_kind if final else None)}
 
 
@@ -1272,7 +1344,8 @@ def answer_many(body: AnswerManyBody):
                                                       or body.accept_recommended)))
             results.append({"board": it.board, "task_id": it.task_id, "ok": True,
                             "choice": r.get("choice"), "option_text": r.get("option_text"),
-                            "status_before": r.get("status_before"), "status_after": r.get("status_after")})
+                            "status_before": r.get("status_before"), "status_after": r.get("status_after"),
+                            "owner_action": r.get("owner_action"), "promoted": r.get("promoted")})
         except HTTPException as e:
             results.append({"board": it.board, "task_id": it.task_id, "ok": False, "error": e.detail})
         except Exception as e:
