@@ -311,19 +311,45 @@ class OwnerActionIsNotADecision(unittest.TestCase):
 
     # ---------------------------------------------------------------- red on base
 
+    def _pre_change_revision(self):
+        """The newest revision of the route module that does NOT carry the fix's own predicate.
+
+        ⛔ NOT `origin/main` (kanban t_d4fc2d80, found by running this arm AFTER the fix was
+        pushed): `origin/main` MOVES, so the moment the change landed it became the TREATMENT and
+        this arm went red -- a control ref is as stale as the lane that wrote it. And not a
+        hard-coded sha either: that rots the other way, silently grading a revision nobody runs.
+        So the guard keys on the PREDICATE the fix introduces (`_OWNER_ACTION_RE`), which is what
+        `engineering-discipline` §42b requires -- a comment-only edit cannot make a ref look
+        pre-change, and the newest such revision IS the production bytes this change replaced.
+        """
+        try:
+            log = subprocess.run(["git", "log", "--format=%H", "--", "dashboard/plugin_api.py"],
+                                 cwd=str(REPO), capture_output=True, text=True, check=False)
+        except OSError as exc:
+            return None, None, "git unavailable (%s)" % exc
+        if log.returncode != 0 or not log.stdout.strip():
+            return None, None, "no history for dashboard/plugin_api.py"
+        for sha in log.stdout.split():
+            try:
+                blob = subprocess.run(["git", "show", "%s:dashboard/plugin_api.py" % sha],
+                                      cwd=str(REPO), capture_output=True, text=True, check=False)
+            except OSError as exc:
+                return None, None, "git unavailable (%s)" % exc
+            if blob.returncode != 0:
+                continue
+            if "_OWNER_ACTION_RE" in blob.stdout or "def answer(" not in blob.stdout:
+                continue          # the fix's own predicate, or not the route module: not the base
+            return sha, blob.stdout, ""
+        return None, None, "no pre-change revision carries the route module"
+
     def test_the_pre_change_bytes_did_move_the_card(self):
         """RED ON BASE: an arm that cannot fail is not a control."""
-        try:
-            blob = subprocess.run(["git", "show", "origin/main:dashboard/plugin_api.py"],
-                                  cwd=str(REPO), capture_output=True, text=True, check=False)
-        except OSError as exc:
-            print("\n[SKIP] red-on-base: git unavailable (%s)" % exc)
-            return
-        if blob.returncode != 0 or "def answer(" not in blob.stdout:
-            print("\n[SKIP] red-on-base: no pre-change revision reachable from origin/main")
-            return
+        sha, src, why = self._pre_change_revision()
+        if src is None:
+            raise AssertionError("red-on-base cannot be skipped: %s -- this is the arm that "
+                                 "proves the positive arm measures something" % why)
         tmp = Path(self.home) / "base_plugin_api.py"
-        tmp.write_text(blob.stdout, encoding="utf-8")
+        tmp.write_text(src, encoding="utf-8")
         base = load_api(tmp)
         tid = api.kanban_db.create_task(
             self.conn, title="owner action ask, base bytes",
@@ -333,7 +359,7 @@ class OwnerActionIsNotADecision(unittest.TestCase):
         before = self.events(tid)
         res = base.answer(base.AnswerBody(board=SLUG, task_id=tid, choice=1))
         delta = [k for k in self.events(tid)[len(before):]]
-        print("\n[RED-ON-BASE] %s" % tid)
+        print("\n[RED-ON-BASE] %s  (pre-change revision %s)" % (tid, sha[:12]))
         print("   status_before=%r status_after=%r" % (res.get("status_before"),
                                                        res.get("status_after")))
         print("   events EMITTED: %s" % (delta,))
