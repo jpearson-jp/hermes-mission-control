@@ -77,6 +77,13 @@ _OWNER_OPTIONS = None
 OPTION_PREVIEW_CHARS = 260
 ASK_PREVIEW_CHARS = 700
 
+#: The RECORD's cap, used only by the local arm of `_answer_record_line` -- i.e. only when
+#: `lib/owner_options.py` cannot be imported. It is that module's own `MAX_OPTION_CHARS`, and
+#: it is the cap BY CONSTRUCTION: an option longer than it is not an option at all (`parse`
+#: refuses the line and the block with it), so a record that carries the option's own bytes
+#: cannot be unbounded. The suite binds this literal to the shared one, so the two cannot drift.
+RECORD_CAP_FALLBACK = 1200
+
 # Cheap, honest triage tags for the ask text — a label, not a classification to trust blindly.
 _HINT_PATTERNS = (
     ("deadline", re.compile(r"\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|"
@@ -214,8 +221,13 @@ def _reason_from_payload(payload: Optional[str]) -> Optional[str]:
     return None
 
 
-def parse_frame(text: Optional[str]) -> dict[str, Any]:
+def parse_frame(text: Optional[str], *, preview: bool = True) -> dict[str, Any]:
     """The owner ask ``text`` carries, in this page's shape -- the ONE parser's verdict.
+
+    ``preview=True`` (the default, what every READER of this page wants) cuts each option to
+    ``OPTION_PREVIEW_CHARS`` for display. ``preview=False`` carries the option's own bytes, and
+    the ONLY caller that asks for it is the answer route: the RECORD of a pick must be the
+    option, not the page's preview of it (kanban t_b92c53cf -- see `_card_frame`).
 
     ⛔ THE MARK IS A HEADING ON A LINE OF ITS OWN, NOT A SUBSTRING (kanban t_c8674e51).
     MEASURED 2026-09-22 on the live board: this function used to slice from the FIRST occurrence
@@ -247,8 +259,8 @@ def parse_frame(text: Optional[str]) -> dict[str, Any]:
             log.warning("owner_options.parse raised; falling back to the local "
                         "heading-anchored parse", exc_info=True)
         else:
-            return _frame_from_parsed(out, text, parsed)
-    return _frame_local(out, text)
+            return _frame_from_parsed(out, text, parsed, preview=preview)
+    return _frame_local(out, text, preview=preview)
 
 
 def _owner_action_local(text: str) -> Optional[int]:
@@ -277,8 +289,8 @@ def _owner_action_local(text: str) -> Optional[int]:
         return None
 
 
-def _frame_from_parsed(out: dict[str, Any], text: str,
-                       parsed: Optional[dict]) -> dict[str, Any]:
+def _frame_from_parsed(out: dict[str, Any], text: str, parsed: Optional[dict],
+                       *, preview: bool = True) -> dict[str, Any]:
     """This page's shape, from `lib/owner_options.parse`'s verdict (``None`` == refused)."""
     if parsed is None:
         return out
@@ -293,7 +305,7 @@ def _frame_from_parsed(out: dict[str, Any], text: str,
            else _owner_action_local(text))
     out.update({
         "framed": True,
-        "options": [t[:OPTION_PREVIEW_CHARS] for t in options],
+        "options": list(options) if not preview else [t[:OPTION_PREVIEW_CHARS] for t in options],
         "recommendation": rec if rec and 1 <= rec <= len(options) else None,
         "owner_action": act if act and 1 <= act <= len(options) else None,
         "summary": (parsed.get("summary") or "")[:ASK_PREVIEW_CHARS] or None,
@@ -314,12 +326,16 @@ def _last_frame_heading(text: str):
     return found
 
 
-def _frame_local(out: dict[str, Any], text: str) -> dict[str, Any]:
+def _frame_local(out: dict[str, Any], text: str, *, preview: bool = True) -> dict[str, Any]:
     """The fallback parse -- heading-anchored, never a substring slice.
 
     Reached only when `lib/owner_options.py` cannot be imported. A page that silently hid every
     ask would be the worse failure, so it keeps reading; it anchors on the heading, so it cannot
     resurrect the prose-mention defect it replaces.
+
+    ``preview`` is `parse_frame`'s, and this arm honours it identically: a fallback that cut
+    what the record carries would put the t_b92c53cf defect back on exactly the hosts where the
+    shared parser is missing.
     """
     head = _last_frame_heading(text)
     if head is None:
@@ -344,7 +360,7 @@ def _frame_local(out: dict[str, Any], text: str) -> dict[str, Any]:
             break
     out.update({
         "framed": True,
-        "options": [t[:OPTION_PREVIEW_CHARS] for t in texts],
+        "options": list(texts) if not preview else [t[:OPTION_PREVIEW_CHARS] for t in texts],
         "recommendation": int(rec.group(1)) if rec and 1 <= int(rec.group(1)) <= len(numbers) else None,
         "owner_action": (lambda n: n if n and 1 <= n <= len(numbers) else None)(
             _owner_action_local(text)),
@@ -1127,13 +1143,24 @@ def _card_frame(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     `_frame_bodies` is what the page renders the owner's options from, so a verb that resolved an
     option or a recommendation off any other parse could record an answer for an option the owner
     was never shown. One reader, one rule.
+
+    ⛔ ``preview=False`` -- THE RECORD IS NOT A PREVIEW (kanban t_b92c53cf). Every READER of this
+    module wants the 260-character display cut; the answer route does not, because the line it
+    writes onto the card is the RECORD of a ruling. MEASURED 2026-09-27 by
+    `owner-answer-record-census.py` over every board: 87 of the 142 stored answers under the
+    dashboard's own handle -- on 72 distinct cards -- carry a strict PREFIX of the option they
+    name, because this function handed `_resolve_choice` the display cut and `_owner_comment`
+    wrote it down as the answer. Two of those tails carried a value the ruling needed
+    (`tos:t_2a383024` an Azure app-id list, `tos:t_98bdb892` 741 characters naming a file path,
+    a command and the verdict strings that prove it took). The page's own list keeps the cut --
+    `_card_frame` is the ONE caller that asks for the option's whole bytes.
     '''
-    return parse_frame(_frame_bodies(conn, [task_id]).get(task_id))
+    return parse_frame(_frame_bodies(conn, [task_id]).get(task_id), preview=False)
 
 
 def _resolve_choice(frame: dict[str, Any], choice: Optional[int], option_text: Optional[str],
-                    accept_recommended: bool) -> tuple[Optional[int], Optional[str]]:
-    '''(choice, option_text) for an owner answer, with the card's own frame filling the gaps.
+                    accept_recommended: bool) -> tuple[Optional[int], Optional[str], Optional[int]]:
+    '''(choice, option_text, shown) for an owner answer, with the card's own frame filling the gaps.
 
     `accept_recommended` is the bulk control's act: the owner accepts the recommendation each
     card's OWN frame carries, so the server reads it per card rather than trusting a client to
@@ -1143,6 +1170,18 @@ def _resolve_choice(frame: dict[str, Any], choice: Optional[int], option_text: O
 
     The option TEXT is resolved the same way when a caller sends only an index, so the comment
     records WHAT was chosen rather than a bare number.
+
+    ⛔ AND WHAT IS RECORDED IS THE OPTION, NOT THE PAGE'S PREVIEW OF IT (kanban t_b92c53cf).
+    `frame` comes from `_card_frame`, which carries the option's own bytes; the page sends back
+    `OPTION_PREVIEW_CHARS` of it, and the owner's act is over the OPTION -- the preview is how
+    the page DREW it. So a sent text that is a strict prefix of the card's own option is recorded
+    as the WHOLE option, and the number of characters he was actually shown comes back as
+    `shown`, which `_owner_comment` discloses on the card. MEASURED 2026-09-27: recording the
+    preview instead is what lost the tail of 87 stored answers.
+
+    A sent text that is NOT a prefix of the card's option is left exactly as it arrived: that is
+    not a preview of this option, and this route does not overwrite what a caller asserted the
+    owner saw. Returns ``(choice, option_text, shown)``.
     '''
     if choice is None and accept_recommended:
         rec = frame.get("recommendation")
@@ -1151,15 +1190,21 @@ def _resolve_choice(frame: dict[str, Any], choice: Optional[int], option_text: O
                 status_code=409,
                 detail="no RECOMMENDATION on this card's frame to accept")
         choice = int(rec)
-    if choice is not None and not (option_text or "").strip():
-        opts = frame.get("options") or []
-        try:
-            idx = int(choice)
-        except (TypeError, ValueError):
-            idx = 0
-        if 1 <= idx <= len(opts):
-            option_text = opts[idx - 1]
-    return choice, option_text
+    opts = frame.get("options") or []
+    try:
+        idx = int(choice) if choice is not None else 0
+    except (TypeError, ValueError):
+        idx = 0
+    full = opts[idx - 1] if 1 <= idx <= len(opts) else None
+    shown: Optional[int] = None
+    sent = (option_text or "").strip()
+    if full:
+        if not sent:
+            option_text = full
+        elif sent != full and full.startswith(sent):
+            shown = len(sent)
+            option_text = full
+    return choice, option_text, shown
 
 
 class AnswerBody(BaseModel):
@@ -1186,15 +1231,57 @@ def _write_conn(slug: str):
     return kbc.connect(board=slug)
 
 
+def _answer_record_line(choice: Optional[int], option_text: Optional[str],
+                        shown: Optional[int] = None) -> str:
+    """The ONE line a pick is recorded as -- `lib/owner_options.answer_record_line`'s rule.
+
+    ⛔ THE FALLBACK, NOT THE RULE (kanban t_b92c53cf). `lib/owner_options.py` owns the rule,
+    beside the parser that says what an option IS, and this route reads it from there. This
+    exists so a plugin revision cannot OUTRUN the parser revision it ships against -- the same
+    class as `_owner_action_local`'s closed trailer. It implements the SAME rule deliberately,
+    and NOT the pre-fix behaviour: a fallback that kept cutting the record would leave this
+    card's defect live on exactly the hosts where the scripts store has not installed yet. The
+    suite binds the two on one fixture, so a drift fails a check instead of silently re-cutting
+    a ruling.
+    """
+    mod = _owner_options()
+    fn = getattr(mod, "answer_record_line", None) if mod is not None else None
+    if fn is not None:
+        try:
+            return fn(choice, option_text, shown=shown)
+        except Exception:
+            log.warning("owner_options.answer_record_line raised; using the local rule",
+                        exc_info=True)
+    text = (option_text or "").strip()
+    cut = ""
+    if len(text) > RECORD_CAP_FALLBACK:
+        kept = text[:RECORD_CAP_FALLBACK].rstrip()
+        cut = ("⛔ RECORD CUT: this option is %d characters; the record stores the first %d and "
+               "%d are NOT stored. The option's own bytes are on the card -- read the ask, not "
+               "this line, for the whole of it."
+               % (len(text), len(kept), len(text) - len(kept)))
+        text = kept
+    if text and text[-1] not in ".!?":
+        text += "."
+    line = "Option %s chosen" % choice + (": %s" % text if text else ".")
+    if shown is not None and text and int(shown) < len(text):
+        line += ("\nNote: the page showed the first %d characters of this option; the whole "
+                 "option is recorded here." % int(shown))
+    if cut:
+        line += "\n" + cut
+    return line
+
+
 def _owner_comment(choice: Optional[int], option_text: Optional[str], text: Optional[str],
-                   owner_action: bool = False) -> str:
+                   owner_action: bool = False, shown: Optional[int] = None) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"**OWNER DECISION** — answered from Mission Control ({stamp})", ""]
     if choice is not None:
-        chosen = (option_text or "").strip()
-        if chosen and chosen[-1] not in ".!?":
-            chosen += "."
-        lines.append(f"Option {choice} chosen" + (f": {chosen}" if chosen else "."))
+        # ⛔ THE RECORD IS THE OPTION'S OWN BYTES (kanban t_b92c53cf). The line used to be built
+        # here, from whatever `_resolve_choice` handed back -- which was the page's 260-character
+        # PREVIEW -- so 87 stored answers carry a strict prefix of the option they name. The rule
+        # now lives with the parser, and this writes it down.
+        lines.append(_answer_record_line(choice, option_text, shown=shown))
     if owner_action:
         # ⛔ WHY THIS LINE IS HERE (kanban t_d4fc2d80). The selection IS his act and belongs on the
         # card, but the card does NOT move on it: the park lifts when the act itself lands (his
@@ -1230,8 +1317,8 @@ def answer(body: AnswerBody):
             if why:
                 raise HTTPException(status_code=409, detail=why)
         frame = _card_frame(conn, body.task_id)
-        choice, option_text = _resolve_choice(frame, body.choice, body.option_text,
-                                              body.accept_recommended)
+        choice, option_text, shown = _resolve_choice(frame, body.choice, body.option_text,
+                                                     body.accept_recommended)
         # ⛔ AN OWNER ACTION IS NOT A DECISION (kanban t_d4fc2d80). MEASURED three times round on
         # `protection-suite:t_01242e2d`: the frame's option 1 was "do the short read yourself",
         # the owner selected it, and this route read the selection as a machine-applicable
@@ -1244,7 +1331,8 @@ def answer(body: AnswerBody):
         owner_action = bool(choice is not None and frame.get("owner_action") == choice)
         comment_id = kanban_db.add_comment(
             conn, body.task_id, "jesse",
-            _owner_comment(choice, option_text, body.text, owner_action=owner_action),
+            _owner_comment(choice, option_text, body.text, owner_action=owner_action,
+                           shown=shown),
         )
         after = before
         promoted = False
