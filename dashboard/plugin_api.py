@@ -786,6 +786,46 @@ def _comments_by_task(conn: sqlite3.Connection, ids: list[str],
     return out
 
 
+def _already_answered(lib, comments) -> bool:
+    '''Is this card's ask closed by the OWNER -- asked in the GUARD's own terms?
+
+    ⛔ NOT `lib.ruling_evidence` (kanban t_8b100717). That answers the ASK QUEUE's question --
+    "has a ruling been RECORDED, so the nag need not ask again?" -- and it is deliberately WIDE:
+    a lane RELAYING the owner's words counts, and an owner-handle comment counts whatever its
+    provenance. THIS page asks a narrower one: "may I stop SHOWING him this ask?" A card that
+    only a lane's marker closes is NOT answered at all -- `protected-write-unblock-guard` asks
+    `lib/owner_answer.is_declared_owner_answer` and refuses to lift its park -- so excluding it
+    HID the ask from the one surface that can answer it, and the excluded row's own affordance
+    ("open card") has no answer control.
+
+    MEASURED 2026-09-29, every board, every `block_kind='needs_input'` park in
+    `status IN ('blocked','triage')` (40 cards): `ruling_evidence` dropped 9 as "already
+    answered"; THREE carried no declared answer and no selection record --
+    `hermes-smith/t_adeae457` (a lane's own measurement note, marker `answered from Mission
+    Control`), `protection-suite/t_f86079f3` (marker `owner decision recorded`) and
+    `protection-suite/t_c22d1d65` (a lane's REFUSAL note, which QUOTES the forged declaration).
+    The first of those is the card that REPORTS this defect: a lane's note about the owner's
+    inbox is what kept the report out of the owner's inbox.
+
+    The narrowing lives in `lib/owner_ask_filter.declared_ruling_evidence` -- imported by
+    IDENTITY like every other predicate on this page, so the page and the guard cannot drift
+    apart again. It answers the owner's DECLARED answer (asked by import of
+    `is_declared_owner_answer`) or the estate's own SELECTION record, and both appeals
+    (`## OWNER HAS NOT RULED`, `## OWNER ACT UNPERFORMED`) still defeat it.
+
+    ⛔ WHEN THE STORE IS OLDER THAN THIS PAGE, NOTHING IS EXCLUDED ON THIS ARM -- this page's
+    own declared degradation (`_ask_filter`: "a page that silently hid a real ask would be the
+    worse failure"). It shows one card too many until the store lands; it never hides one.
+    '''
+    narrowed = getattr(lib, "declared_ruling_evidence", None)
+    if narrowed is None:
+        log.warning("owner_ask_filter.declared_ruling_evidence is absent (the scripts store is "
+                    "older than this page): 'Waiting on Me' will list cards a declared owner "
+                    "answer has already closed -- the SAFE direction, never a hidden ask")
+        return False
+    return bool(narrowed(comments))
+
+
 def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
     """Every owner-facing park on this board, split into framed asks and un-framed parks.
 
@@ -806,6 +846,12 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         # approved work whose only remaining act is a publication the release authority
         # owns. Same predicates as the nag, the framer and the brief -- imported, not
         # re-spelled. See `_ask_filter`.
+        #
+        # ⛔ EXCEPT THE "ALREADY ANSWERED" ARM, WHICH ASKS A NARROWER QUESTION (kanban
+        # t_8b100717). `ruling_evidence` is the QUEUE's question ("has a ruling been
+        # RECORDED?"); this page's is "may I stop SHOWING him this ask?", and the two
+        # disagree on exactly the cards a lane's marker closes without an owner answer.
+        # `_already_answered` asks the guard's own predicate instead.
         excluded: dict[str, str] = {}
         lib = _ask_filter()
         if lib is not None:
@@ -813,7 +859,7 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
                 if lib.publication_park(payloads.get(r["id"])):
                     excluded[r["id"]] = "publication-only"
                     continue
-                if lib.ruling_evidence(comments.get(r["id"]) or ()):
+                if _already_answered(lib, comments.get(r["id"]) or ()):
                     excluded[r["id"]] = "already answered"
             # (3) DUPLICATE, over the survivors of THIS board: a twin is dropped only when
             # its carrier is still in this same list, so the question is shown once.
