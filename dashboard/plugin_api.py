@@ -751,15 +751,28 @@ def _park_payloads(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
 
 
 def _comments_by_task(conn: sqlite3.Connection, ids: list[str],
-                      per_task: int = 25) -> dict[str, list[tuple[str, str]]]:
+                      per_task: Optional[int] = None) -> dict[str, list[tuple[str, str]]]:
     """The newest `per_task` comments per task, newest first — what the predicates read.
 
-    Bounded on purpose. `hermes-decision-nag` reads 40 and this reads 25, and the
-    asymmetry is in the SAFE direction only: a ruling recorded 30 comments deep is still
-    caught by the nag (which then declines to ask) while this page may still list it —
-    a page that shows one card too many, never one too few. Bodies are capped at 4 000
-    chars for the same reason (a busy card's newest comment is routinely 40 KB).
+    ⛔ THE WINDOW IS `owner_ask_filter.COMMENT_WINDOW`, IMPORTED NOT RE-SPELLED (kanban
+    t_063063df, measured 2026-09-28). This function hard-coded 25 while `hermes-decision-nag`
+    read the shared 40, and the docstring used to claim the asymmetry was "in the SAFE
+    direction only -- a page that shows one card too many, never one too few". That claim is
+    FALSE for the APPEAL arms, and it is the FAIL-UNSAFE direction when it fails: a RULING
+    deeper than this page's window is missed by the page (which therefore LISTS the card --
+    one too many, benign), but an APPEAL deeper than the window is missed too and the page
+    then EXCLUDES a card the nag still asks about. MEASURED on the live `tos` board
+    2026-09-28T02:3xZ with both readers run side by side: `t_2a383024` (its `## OWNER HAS NOT
+    RULED` appeal at comment position 40 of 45) and `t_d3efbd10` (position 29 of 29) were
+    dropped from THIS page as "already answered" while the nag -- same predicate, shared 40
+    window -- asked them. Both appeal arms are read by the SAME anchoring rule, so this
+    page's window must never be NARROWER than the nag's: one definition, many readers.
+    Bodies are capped at 4 000 chars for the same reason (a busy card's newest comment is
+    routinely 40 KB).
     """
+    if per_task is None:
+        _lib = _ask_filter()
+        per_task = int(getattr(_lib, "COMMENT_WINDOW", 40)) if _lib is not None else 40
     out: dict[str, list[tuple[str, str]]] = {}
     for chunk in _chunks(ids):
         marks = ",".join("?" * len(chunk))
