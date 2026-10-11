@@ -49,6 +49,10 @@
 .mc-row-t { font-size: .86rem; font-weight: 500; }
 .mc-row-m { font-size: .72rem; color: var(--color-muted-foreground); display: flex; flex-wrap: wrap; gap: .4rem .7rem; align-items: center; }
 .mc-ask { font-size: .78rem; opacity: .92; white-space: pre-wrap; border-left: 2px solid var(--color-border); padding-left: .55rem; }
+/* ⛔ THE FROZEN PARK REASON, SHOWN AS CONTEXT RATHER THAN AS THE ASK (kanban t_f18750d7): a
+   `needs_input` park reason cannot be rewritten in place, so when a newer carrier block supersedes
+   it the row still shows it — demoted, so it is never read as the live ask. */
+.mc-park { opacity: .72; font-style: italic; }
 .mc-sum { font-size: .78rem; color: var(--color-muted-foreground); }
 
 .mc-pill { font-size: .64rem; text-transform: uppercase; letter-spacing: .06em; padding: .12rem .4rem; border-radius: 999px;

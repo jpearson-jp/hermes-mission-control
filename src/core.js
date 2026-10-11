@@ -252,8 +252,19 @@
       h(CardTools, { item: item }),
       item.summary ? h("div", { className: "mc-sum" }, item.summary) : null,
       !open && item.ask ? h("div", { className: "mc-ask" }, item.ask.slice(0, 320) + (item.ask.length > 320 ? "…" : "")) : null,
+      // ⛔ THE PARK REASON IS LABELLED, NOT PRESENTED AS THE ASK (kanban t_f18750d7). The ask is
+      // the NEWEST of the card's two statements of the question — the backend derives it and
+      // leaves `ask` empty when the carrier block is the newer one, because `mc-sum` above is then
+      // already showing those exact bytes. A `needs_input` park reason cannot be rewritten in
+      // place while the card stays parked, so when a newer carrier supersedes it the frozen text
+      // is still shown — as WHAT IT IS, the reason the card was parked — never as the live ask.
+      !open && item.park_reason && item.park_reason !== item.ask
+        ? h("div", { className: "mc-ask mc-park" }, "why it was parked: " +
+            item.park_reason.slice(0, 320) + (item.park_reason.length > 320 ? "…" : "")) : null,
       open ? h("div", { className: "mc-cards" },
         item.ask ? h("div", { className: "mc-ask" }, item.ask) : null,
+        item.park_reason && item.park_reason !== item.ask
+          ? h("div", { className: "mc-ask mc-park" }, "why it was parked: " + item.park_reason) : null,
         (item.options || []).map(function (o, i) {
           var n = i + 1, rec = item.recommendation === n;
           return h("button", {
@@ -314,8 +325,14 @@
         h("pre", { className: "mc-brief-pre" }, d.briefing || "")),
       d.frame && d.frame.summary ? h("div", { className: "mc-sum" }, d.frame.summary) : null,
       h("div", { className: "mc-body" }, t.body || "(no body)"),
-      h("div", { className: "mc-muted" }, "ask (newest park event's reason)"),
+      h("div", { className: "mc-muted" }, d.ask_source === "carrier"
+        ? "the ask (the card's NEWEST carrier block — the `## OPTIONS FOR THE OWNER` Summary; the park reason below is the SUPERSEDED one)"
+        : "the ask (newest park event's reason)"),
       h("div", { className: "mc-ask" }, d.ask || "(none recorded)"),
+      d.park_reason && d.park_reason !== d.ask
+        ? h("div", { className: "mc-muted" }, "why it was parked (the frozen park reason — a `needs_input` park reason cannot be rewritten in place while the card stays parked)") : null,
+      d.park_reason && d.park_reason !== d.ask
+        ? h("div", { className: "mc-ask mc-park" }, d.park_reason) : null,
       h("div", { className: "mc-muted" }, "runs: " + d.runs.length + " · comments: " + d.comments.length),
       h("div", { className: "mc-cards" }, d.comments.slice(0, 8).map(function (c) {
         return h("div", { key: c.id, className: "mc-cmt" },
