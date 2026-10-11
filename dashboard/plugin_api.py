@@ -494,6 +494,78 @@ def _frame_bodies(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
     return out
 
 
+def _frame_carrier_times(conn: sqlite3.Connection, ids: list[str]) -> dict[str, int]:
+    """The CARRIER block's own comment time per task -- the SAME comment ``_frame_bodies`` picks.
+
+    ONE rule, TWO projections: the body (what the page renders) and its ``created_at`` (what the
+    ask derivation compares against the park event). Both are read with the same LIKE-candidate +
+    ``parse_frame`` verdict + newest-first order, so the body and the time can never be two
+    different comments. ``_frame_bodies``' docstring carries why the parser, not the LIKE, is the
+    verdict.
+    """
+    out: dict[str, int] = {}
+    for chunk in _chunks(ids):
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT task_id, body, created_at FROM task_comments "
+            f"WHERE task_id IN ({marks}) AND body LIKE '%OPTIONS FOR THE OWNER%' "
+            f"ORDER BY id DESC", chunk):
+            tid = row["task_id"]
+            if tid in out:
+                continue                       # a NEWER comment already framed this task
+            if row["body"] and parse_frame(row["body"])["framed"]:
+                out[tid] = row["created_at"]
+    return out
+
+
+def _live_ask(park_reason: Optional[str], park_at: Optional[int],
+              carrier_summary: Optional[str], carrier_at: Optional[int]) -> tuple:
+    """``(the ask the owner reads, where it came from)`` -- the NEWEST of the card's two asks.
+
+    ⛔ WHY THE ASK IS DERIVED AND NOT THE FROZEN PARK REASON (kanban t_f18750d7, MEASURED
+    2026-10-11 on the live ``tos`` board).
+
+    The park reason is the text this page has always rendered as THE ASK. It is also IMMUTABLE
+    while the card stays parked on the owner: ``kanban_db.block_task`` REFUSES a same-kind
+    re-park on an already-parked card (``block acts only on running/ready/todo``) -- executed
+    against a copy of the live board -- and the one re-type that DOES rewrite the reason moves
+    the card OUT of the owner lane (``block_kind`` -> ``capability``), which is the defect
+    ``test-adjudication-owner-premise-rekey.py`` exists for. So a park reason whose premise has
+    moved is a text NOTHING can correct, and the owner reads a falsified sentence.
+
+    The CARRIER block is the opposite: it IS re-cut whenever a measurement overtakes it
+    (``decision-framer``'s ``recut_the_block``), and this page ALREADY renders its Summary and
+    its options. Two live instances, both Edge asks:
+
+      * ``tos:t_1eb7c762`` -- park 11:17Z: the alarm is "dead today because BUS_INTEGRATION_KEY
+        is unbound"; carrier re-cut 17:29Z: the binding landed and the alarm is live.
+      * ``tos:t_5e354bea`` -- park 2026-10-07: "option 1 or 2 needs Key Vault write"; carrier
+        re-cut 17:48Z: the credential half is a lane's and is already supplied.
+
+    THE NEWEST TEXT WINS. That is also the estate's own rule for the block itself
+    (``lib/owner_options.carrier_and_superseded``: the newest block is the carrier) and what
+    ``owner-ask-prompt.py`` already asks him through ``clarify`` -- the block's Summary, never
+    the park reason. It can only ever show a text at least as fresh as the park reason this page
+    shows today, so the OTHER drift direction is preserved: ``owner-ask-frame-drift.py`` exists
+    for a park that POSTDATES the newest frame and names an act the frame does not offer -- there
+    the park reason (newer) still wins until the framing lane re-cuts the frame.
+
+    Returns ``(text, source)`` with ``source`` in ``("park", "carrier")``, or ``(None, None)``
+    when the card carries neither. A block that parses but carries no Summary is NOT an ask
+    (``lib/owner_options``' own rule: ``owner-ask-prompt.py`` refuses it), so it falls back to
+    the park reason. A card with no park event at all takes the carrier.
+    """
+    park = (park_reason or "").strip()
+    carrier = (carrier_summary or "").strip()
+    if carrier and (park_at is None or (carrier_at is not None and carrier_at >= park_at)):
+        return carrier, "carrier"
+    if park:
+        return park, "park"
+    if carrier:
+        return carrier, "carrier"
+    return None, None
+
+
 def _ask_reasons(conn: sqlite3.Connection, ids: list[str],
                  payloads: Optional[dict[str, str]] = None) -> dict[str, str]:
     """The ASK text per task: the reason on the card's NEWEST PARK EVENT (kanban t_68504b12).
@@ -527,11 +599,17 @@ def _ask_reasons(conn: sqlite3.Connection, ids: list[str],
 
 def _briefing(board: str, board_title: str, task_id: str, title: str, status: str, block_kind: str,
               age_seconds: Optional[int], asked_by: Optional[str], ask: Optional[str],
-              options: Optional[list[str]] = None, recommendation: Optional[int] = None) -> str:
+              options: Optional[list[str]] = None, recommendation: Optional[int] = None,
+              ask_source: Optional[str] = None, park_reason: Optional[str] = None) -> str:
     """A paste-ready handoff: everything a chat agent needs to discuss this card with Jesse.
 
     Lives server-side so the dashboard button, any future surface, and a curl all produce the same
     text — and so it is testable without a browser.
+
+    ``ask`` is the LIVE ask (``_live_ask``), and ``ask_source`` names where it came from, so the
+    label cannot claim the park reason is what the owner is reading when the carrier supersedes it
+    (kanban t_f18750d7). ``park_reason`` is the frozen text, quoted when it differs — a reader must
+    be able to see both the ask and the superseded premise it replaced.
     """
     hours = (age_seconds or 0) / 3600.0
     age = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
@@ -547,11 +625,28 @@ def _briefing(board: str, board_title: str, task_id: str, title: str, status: st
         for i, opt in enumerate(options, 1):
             mark = "  <-- the card's RECOMMENDATION" if recommendation == i else ""
             lines.append(f"  {i}. {opt}{mark}")
+    if ask_source == "carrier":
+        ask_label = ("THE ASK (verbatim — the card's NEWEST carrier block: the Summary of its "
+                     "`## OPTIONS FOR THE OWNER` block, the same text `owner-ask-prompt.py` asks "
+                     "him through `clarify`. It POSTDATES the card's newest park event, so it is "
+                     "the live ask and the park reason below it is SUPERSEDED):")
+    else:
+        ask_label = ("THE ASK (verbatim — the reason on the card's NEWEST park event: blocked, "
+                     "block_retyped or block_loop_detected):")
     lines += [
         "",
-        "THE ASK (verbatim — the reason on the card's NEWEST park event: blocked, "
-        "block_retyped or block_loop_detected):",
-        (ask or "(no park reason recorded)"),
+        ask_label,
+        (ask or "(no ask recorded)"),
+        "",
+    ]
+    if park_reason and park_reason != ask:
+        lines += [
+            "WHY IT WAS PARKED (the frozen park reason — SUPERSEDED by the carrier above; a "
+            "`needs_input` park reason cannot be rewritten in place while the card stays parked):",
+            park_reason,
+            "",
+        ]
+    lines += [
         "",
         "My question: explain in plain language what this card is actually about, which project or "
         "system it belongs to, and whether it is genuinely mine to decide — then tell me what you "
@@ -836,7 +931,10 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         rows = _q(conn, _AWAITING_SQL)
         all_ids = [r["id"] for r in rows]
         framed_bodies = _frame_bodies(conn, all_ids)
-        payloads = _park_payloads(conn, all_ids)
+        carrier_times = _frame_carrier_times(conn, all_ids)
+        park_events = _newest_park_events(conn, all_ids)
+        payloads = {tid: ev["payload"] for tid, ev in park_events.items()}
+        park_times = {tid: ev["created_at"] for tid, ev in park_events.items()}
         comments = _comments_by_task(conn, all_ids)
 
         # ⛔ THE ASK QUEUE'S THREE EXCLUSIONS, APPLIED HERE TOO (kanban t_3d6ec309).
@@ -895,8 +993,22 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
         r = by_id[task_id]
         body = framed_bodies.get(task_id)
         frame = parse_frame(body)
-        ask = reasons.get(task_id)
-        hinted = bool(ask and _HUMAN_HINT_RE.search(ask))
+        park = reasons.get(task_id)
+        # ⛔ THE ASK THE OWNER READS IS DERIVED, NOT THE FROZEN PARK REASON (kanban t_f18750d7).
+        # `_live_ask` returns the NEWEST of the card's two statements of the question and names
+        # which it took; its docstring carries the measurement (a `needs_input` park reason cannot
+        # be rewritten in place while the card stays parked, while the carrier IS re-cut when a
+        # measurement overtakes it).
+        live, ask_source = _live_ask(park, park_times.get(task_id),
+                                     frame["summary"], carrier_times.get(task_id))
+        # RENDERED ONCE: when the live ask came from the CARRIER, the row's own `mc-sum` line is
+        # already showing those exact bytes (the block's Summary), so `ask` is left empty rather
+        # than printing the same sentence twice. `park_reason` keeps the frozen text in the payload
+        # for the briefing and for any reader that wants the superseded premise.
+        ask_field = (live or "")[:ASK_PREVIEW_CHARS] or None
+        if ask_source == "carrier":
+            ask_field = None
+        hinted = bool(live and _HUMAN_HINT_RE.search(live))
         bt = _board_title(slug)
         age = _now() - (_int_or_none(r["created_at"]) or _now())
         return {
@@ -908,17 +1020,20 @@ def _awaiting_for_board(slug: str, db: str, limit: int) -> dict[str, Any]:
             "status": r["status"],
             "created_at": _iso(r["created_at"]),
             "age_seconds": age,
-            "ask": (ask or "")[:ASK_PREVIEW_CHARS] or None,
+            "ask": ask_field,
+            "ask_source": ask_source,
+            "park_reason": (park or "")[:ASK_PREVIEW_CHARS] or None,
             "framed": frame["framed"],
             "options": frame["options"],
             "recommendation": frame["recommendation"],
             "summary": frame["summary"],
             "comments": int(r["comments"] or 0),
             "human_hint": hinted,
-            "hints": _hints(ask, r["title"]),
+            "hints": _hints(live, r["title"]),
             "priority": r["priority"],
             "briefing": _briefing(slug, bt, r["id"], r["title"], r["status"], "needs_input", age,
-                                  r["assignee"], ask, frame["options"], frame["recommendation"]),
+                                  r["assignee"], live, frame["options"], frame["recommendation"],
+                                  ask_source=ask_source, park_reason=park),
         }
 
     framed = [item(i) for i in framed_ids]
@@ -1104,11 +1219,17 @@ def card(board: str, task_id: str = Query(..., alias="id")):
         # page and the list must not pick different bodies -- and the 25-comment window meant a
         # block older than 25 comments was invisible here while the list still showed it.
         frame_body = _frame_bodies(conn, [task_id]).get(task_id)
-    # The ask is the NEWEST PARK EVENT, over the same triple every other park reader in this file
-    # uses: a `blocked`-only read shows NO ask for a card that was re-typed or loop-broken into
-    # its park, which is how most cards enter one.
-    ask = _reason_from_payload(next((e["payload"] for e in events if e["kind"] in _park_kinds()), None))
+        carrier_at = _frame_carrier_times(conn, [task_id]).get(task_id)
+    # The ask is DERIVED (kanban t_f18750d7): the NEWEST of the card's two statements of the
+    # question. The park reason is the newest park EVENT, over the same triple every other park
+    # reader in this file uses -- a `blocked`-only read shows NO ask for a card that was re-typed
+    # or loop-broken into its park, which is how most cards enter one -- and it wins only when it
+    # is not superseded by a newer carrier block. `_live_ask` carries the measurement.
+    park_event = next((e for e in events if e["kind"] in _park_kinds()), None)
+    park = _reason_from_payload(park_event["payload"] if park_event else None)
     frame = parse_frame(frame_body)
+    live, ask_source = _live_ask(park, park_event["created_at"] if park_event else None,
+                                 frame["summary"], carrier_at)
     bt = b["title"]
     age = _now() - (_int_or_none(t["created_at"]) or _now())
     return {
@@ -1124,11 +1245,14 @@ def card(board: str, task_id: str = Query(..., alias="id")):
             "workspace_kind": t["workspace_kind"], "workspace_path": t["workspace_path"],
             "branch_name": t["branch_name"], "project_id": t["project_id"],
         },
-        "ask": ask,
+        "ask": live,
+        "ask_source": ask_source,
+        "park_reason": park,
         "frame": frame,
-        "hints": _hints(ask, t["title"]),
+        "hints": _hints(live, t["title"]),
         "briefing": _briefing(board, bt, t["id"], t["title"], t["status"], t["block_kind"], age,
-                              t["assignee"], ask, frame["options"], frame["recommendation"]),
+                              t["assignee"], live, frame["options"], frame["recommendation"],
+                              ask_source=ask_source, park_reason=park),
         "comments": [{"id": c["id"], "author": c["author"], "body": c["body"],
                       "created_at": _iso(c["created_at"])} for c in comments],
         "runs": [{"id": r["id"], "profile": r["profile"], "status": r["status"], "outcome": r["outcome"],

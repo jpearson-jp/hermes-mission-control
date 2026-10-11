@@ -316,8 +316,15 @@ function AskRow({ item, onDone }) {
     ] }),
     item.summary ? jsx('div', { className: 'mc-row-m', children: item.summary }) : null,
     !open && item.ask ? jsx('div', { className: 'mc-ask', children: item.ask.slice(0, 300) + (item.ask.length > 300 ? '…' : '') }) : null,
+    // ⛔ THE PARK REASON IS LABELLED, NOT PRESENTED AS THE ASK (kanban t_f18750d7): a `needs_input`
+    // park reason cannot be rewritten in place, so when a newer carrier block supersedes it the
+    // frozen text is shown as what it is — the reason the card was parked — never as the live ask.
+    !open && item.park_reason && item.park_reason !== item.ask
+      ? jsx('div', { className: 'mc-ask mc-park', children: 'why it was parked: ' + item.park_reason.slice(0, 300) + (item.park_reason.length > 300 ? '…' : '') }) : null,
     open ? jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' }, children: [
       item.ask ? jsx('div', { className: 'mc-ask', children: item.ask }) : null,
+      item.park_reason && item.park_reason !== item.ask
+        ? jsx('div', { className: 'mc-ask mc-park', children: 'why it was parked: ' + item.park_reason }) : null,
       (item.options || []).map((o, i) => jsxs('button', {
         type: 'button', className: 'mc-opt', 'data-on': choice === i + 1, onClick: () => setChoice(i + 1),
         children: [
@@ -807,7 +814,9 @@ function CardDirective({ attrs }) {
       jsx('span', { children: t.assignee || '—' }),
       jsx('span', { children: t.id })
     ] }),
-    d.ask ? jsx('div', { className: 'mc-ask', children: d.ask }) : null
+    d.ask ? jsx('div', { className: 'mc-ask', children: d.ask }) : null,
+    d.park_reason && d.park_reason !== d.ask
+      ? jsx('div', { className: 'mc-ask mc-park', children: 'why it was parked: ' + d.park_reason }) : null
   ] })
 }
 
